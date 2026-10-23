@@ -4,13 +4,13 @@ event = "sprint-2m"
 task  = "Mjlab-Sprint2m-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # finite race-time candidate; local RTX 3060 recipe
+[recipe]                  # distance-first, then race-time; local RTX 3060 recipe
 num_envs       = 2048
 max_iterations = 3000
 seed           = 2
 
 [params.forward_reward]
-label = "Progress guidance (zero net race reward)"
+label = "Reach the finish (distance first, then speed)"
 value = 5.0
 min   = 0.5
 max   = 5.0
