@@ -6,6 +6,8 @@ Discovery rewards reducing distance to the finish and legal completion, without
 clock pressure. Once finishing is established, new episodes optimise race time
 with terminal-corrected guidance and a tiny head-posture tie-breaker. All 14 servo
 outputs remain free, with the original robot's physical limits unchanged.
+Weak actor mirror consistency encourages bilateral control without prescribing
+a gait; privileged critic observations are not used as mirrored PPO samples.
 
 The velocity template supplies the robot-independent infrastructure. Preserve
 its observation order, BAM servo model, sensor guards, and domain randomization.
@@ -18,8 +20,8 @@ from copy import deepcopy
 
 NUM_STEPS_PER_ENV = 24
 
-# Symmetry
-ENABLE_SYMMETRY = False
+# Soft bilateral policy consistency, not a fixed pose or alternating gait.
+ENABLE_SYMMETRY = True
 
 # Domain randomization toggles
 ENABLE_COM_RANDOMIZATION = True
@@ -589,7 +591,19 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         lam=0.98,  # longer credit assignment; rollout length and run budget unchanged
         desired_kl=0.01,
         max_grad_norm=1.0,
-        symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
+        symmetry_cfg=(
+            {
+                **SYMMETRY_CFG,
+                # The upstream mirror function repeats unmirrored critic state.
+                # Use it only for actor consistency, never PPO data augmentation.
+                "use_data_augmentation": False,
+                "use_mirror_loss": True,
+                # Weaker than the upstream/SteveTarter default of 0.5 so novel
+                # asymmetric states can still produce distinct joint targets.
+                "mirror_loss_coeff": 0.1,
+            }
+            if ENABLE_SYMMETRY else None
+        ),
     ),
     wandb_project="mjlab_microduck",
     experiment_name="sprint_2m",  # logs/rsl_rl/sprint_2m/

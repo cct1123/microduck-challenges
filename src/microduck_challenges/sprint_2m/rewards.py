@@ -292,8 +292,12 @@ def configure_race(cfg, knobs):
     }
     cfg.rewards["upright"] = RewardTermCfg(
         func=PotentialDifference, weight=knobs["upright_reward"],
+        # SteveTarter's dash6 (1d048512e): a 20-degree tilt retains about 56%
+        # of the potential instead of 10%, leaving acceleration lean available.
+        # This widens tilt tolerance, not a target pose or the Arena fall guard.
+        # Keep guidance weak and terminal-corrected, not a standing reward.
         params={
-            "potential": mdp.upright, "std": math.sqrt(0.05),
+            "potential": mdp.upright, "std": math.sqrt(0.2),
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
