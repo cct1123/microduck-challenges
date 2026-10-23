@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 
 import microduck_challenges  # noqa: F401 (register tasks before upstream imports)
 
@@ -29,6 +29,7 @@ def _env(velocities, commands=None, headings=None, gravity_z=None):
     gravity[:, 2] = -1.0 if gravity_z is None else torch.tensor(gravity_z)
     command = torch.zeros(count, 3)
     command[:, 0] = 0.6 if commands is None else torch.tensor(commands)
+    head_command = torch.zeros(count, 4)
     data = SimpleNamespace(
         root_link_lin_vel_w=velocity,
         root_link_quat_w=quat,
@@ -48,7 +49,7 @@ def _env(velocities, commands=None, headings=None, gravity_z=None):
             ),
             "foot_height_scan": SimpleNamespace(data=SimpleNamespace(heights=torch.full((count, 2), 0.04))),
         },
-        command_manager=SimpleNamespace(get_command=lambda name: command),
+        command_manager=SimpleNamespace(get_command=lambda name: head_command if name == "head_pose" else command),
         episode_length_buf=torch.full((count,), 10),
         num_envs=count,
         _heading_ref=yaw.clone(),
@@ -137,6 +138,46 @@ def test_air_time_can_require_support_without_imposing_a_gait_clock():
     torch.testing.assert_close(result, torch.tensor([1.0, 0.0]))
 
 
+def test_head_forward_cost_selects_yaw_roll_and_allows_pitch_bobbing():
+    env = _env([[0.6, 0, 0]] * 3)
+    # Resolve by selectors in production; deliberately use nonstandard ids here.
+    cfg = SceneEntityCfg("robot", joint_ids=[3, 7])
+    env.scene["robot"].data.joint_pos_biased[:, 5:7] = 1.0  # pitch/other joints ignored
+    env.scene["robot"].data.joint_pos_biased[:, 3] = torch.tensor([0.1, 0.65, 0.0])
+    env.scene["robot"].data.joint_pos_biased[:, 7] = torch.tensor([0.1, 0.0, 0.65])
+    cost = _rewards().head_forward_cost(env, asset_cfg=cfg, deadband=0.15)
+    torch.testing.assert_close(cost, torch.tensor([0.0, 0.125, 0.125]))
+    assert (cost >= 0).all()  # must be paired with a NEGATIVE weight
+
+
+def test_swing_drive_rejects_translation_only_and_nonfinite_sensor_data():
+    env = _env([[0.6, 0, 0]] * 3)
+    env.scene["robot"].data.site_lin_vel_w[1:, 0, 0] += 2.0
+    env.scene["foot_height_scan"].data.heights[1, 0] = float("nan")
+    env.scene["feet_ground_contact"].data.found[2, 0] = float("inf")
+    result = _rewards().swing_drive(env, sensor_name="feet_ground_contact", height_sensor_name="foot_height_scan")
+    torch.testing.assert_close(result, torch.zeros(3))
+
+
+@pytest.mark.parametrize("episode_step", [0, 10])
+def test_swing_drive_does_not_turn_an_invalid_heading_into_nan_times_zero(episode_step):
+    env = _env([[0.6, 0, 0]])
+    env.episode_length_buf[:] = episode_step
+    env.scene["robot"].data.site_lin_vel_w[:, 0, 0] += 2.0
+    env.scene["robot"].data.root_link_quat_w[:] = float("nan")
+    result = _rewards().swing_drive(env, sensor_name="feet_ground_contact", height_sensor_name="foot_height_scan")
+    torch.testing.assert_close(result, torch.zeros(1))
+
+
+def test_head_forward_cost_respects_command_and_encoder_view():
+    env = _env([[0.6, 0, 0]])
+    cfg = SceneEntityCfg("robot", joint_ids=[3, 7])
+    env.scene["robot"].data.default_joint_pos[:, [3, 7]] = 0.2
+    env.scene["robot"].data.joint_pos_biased[:, [3, 7]] = 0.6
+    env.command_manager = SimpleNamespace(get_command=lambda name: torch.tensor([[0.0, 0.0, 0.4, 0.4]]))
+    torch.testing.assert_close(_rewards().head_forward_cost(env, asset_cfg=cfg), torch.zeros(1))
+
+
 def test_sprint_config_wires_the_new_rewards_without_changing_the_arena_contract():
     from microduck_challenges.sprint_2m.env import RL_CFG, make_env_cfg
 
@@ -153,6 +194,28 @@ def test_sprint_config_wires_the_new_rewards_without_changing_the_arena_contract
     assert isinstance(command, UniformVelocityCommandCfg)
     assert command.ranges.lin_vel_x == (0.2, 1.2)
     assert RL_CFG.experiment_name == "sprint_2m"
+
+
+def test_aggressive_recipe_replaces_overspeed_penalty_and_opens_stride_freedom():
+    from microduck_challenges.sprint_2m.env import make_env_cfg
+
+    cfg = make_env_cfg()
+    speed = cfg.rewards["track_linear_velocity"]
+    assert speed.func is _rewards().forward_progress
+    assert speed.params["speed_gain"] == 2.5
+    probe = _env([[1.2, 0, 0], [2.4, 0, 0]], commands=[1.2, 1.2])
+    values = speed.func(probe, **speed.params)
+    assert values[1] > values[0]  # the old Gaussian did the opposite here
+    assert cfg.rewards["air_time"].params["require_support"] is True
+    assert cfg.rewards["air_time"].params["threshold_min"] == 0.06
+    assert cfg.rewards["swing_drive"].func is _rewards().swing_drive
+    assert cfg.rewards["swing_drive"].weight > 0
+    assert cfg.rewards["head_forward"].func is _rewards().head_forward_cost
+    assert cfg.rewards["head_forward"].weight < 0
+    assert cfg.rewards["pose"].params["std_walking"][r".*hip_roll.*"] >= 0.15
+    assert cfg.curriculum["action_rate_weight"].params["weight_stages"][-1]["weight"] == -0.3
+    assert cfg.curriculum["standing_envs"].params["standing_stages"][-1]["rel_standing_envs"] == 0.05
+    assert "push_robot" not in cfg.events
 
 
 @pytest.mark.parametrize("parameter", ["lateral_std", "command_threshold"])
@@ -189,19 +252,29 @@ def test_complete_custom_reward_outputs_match_on_cpu_and_cuda():
     velocities = [[0, 0, 0], [0.3, 0.05, 0], [0.6, 0, 0], [-0.3, 0, 0], [1.2, 0.2, 0]]
     cpu = _env(velocities)
     gpu = _env(velocities)
+    for env in (cpu, gpu):
+        env.scene["robot"].data.site_lin_vel_w[:, 0, 0] += 1.0
+        env.scene["robot"].data.joint_pos_biased[:, 7] = 0.5
     data = gpu.scene["robot"].data
     for name, value in vars(data).items():
         setattr(data, name, value.to("cuda:0"))
     gpu.scene["feet_ground_contact"].data.current_air_time = (
         gpu.scene["feet_ground_contact"].data.current_air_time.to("cuda:0")
     )
+    gpu.scene["feet_ground_contact"].data.found = gpu.scene["feet_ground_contact"].data.found.to("cuda:0")
+    gpu.scene["foot_height_scan"].data.heights = gpu.scene["foot_height_scan"].data.heights.to("cuda:0")
     gpu._heading_ref = gpu._heading_ref.to("cuda:0")
     gpu.episode_length_buf = gpu.episode_length_buf.to("cuda:0")
     command = torch.tensor([[0.6, 0.0, 0.0]] * len(velocities), device="cuda:0")
-    gpu.command_manager = SimpleNamespace(get_command=lambda name: command)
+    head = torch.zeros(len(velocities), 4, device="cuda:0")
+    gpu.command_manager = SimpleNamespace(get_command=lambda name: head if name == "head_pose" else command)
     for function, kwargs in [
         (_rewards().forward_progress, {}),
         (_rewards().productive_air_time, {"sensor_name": "feet_ground_contact"}),
+        (_rewards().productive_air_time, {"sensor_name": "feet_ground_contact", "require_support": True}),
+        (_rewards().forward_progress, {"speed_gain": 2.5}),
+        (_rewards().swing_drive, {"sensor_name": "feet_ground_contact", "height_sensor_name": "foot_height_scan"}),
+        (_rewards().head_forward_cost, {"asset_cfg": SceneEntityCfg("robot", joint_ids=[7, 8])}),
     ]:
         actual = function(gpu, **kwargs)
         expected = function(cpu, **kwargs)

@@ -6,7 +6,7 @@ read from challenge.toml ([params]). Everything here is yours to change; the
 robot (MICRODUCK_WALK_ROBOT_CFG) and the reward functions (microduck_mdp)
 come from mjlab_microduck and are not edited here.
 
-The main locomotion task: velocity-command tracking + head-pose commands.
+The main locomotion task: sprint intensity + auxiliary head-pose commands.
 The reward/regularization recipe is locomotion-focused (lean tracking +
 gait/feet terms, curriculum-ramped action-rate smoothing), with:
 
@@ -15,7 +15,7 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
   - fixed command ranges taken straight from the Arena event's sweep
     (arena/events/sprint-2m.toml) — straight ahead only, never sideways or
     turning (see the command section below)
-  - head_pose_tracking as a primary objective, plus an EMA-based head_pose_bias
+  - head_pose_tracking as an auxiliary objective, plus an EMA-based head_pose_bias
     penalty that prices only the escapable DC head droop (see below); the head
     command itself is held at its small initial range (no widening curriculum)
   - body_pose tracking infra kept intact but DISABLED (weight 0) so the obs
@@ -25,6 +25,8 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
     alone sees that heading error
   - productive stepping: a small bounded spawn-frame progress reward, with
     air-time payouts coupled to upright, low-drift forward motion
+  - aggressive speed objective up to 2.5x the Arena command, supported forward
+    foot drive, and broad head yaw/roll alignment without a pitch lock
 """
 
 import math
@@ -35,6 +37,10 @@ NUM_STEPS_PER_ENV = 24
 # Sprint reward candidate: keep these small and compare by Arena finishes/time.
 FORWARD_PROGRESS_WEIGHT = 0.5
 SPRINT_LATERAL_STD = 0.2  # m/s, a soft velocity gate, NOT a lane-position target
+SPRINT_SPEED_GAIN = 2.5  # sweep stays 0.20–1.20; reward saturation reaches 3 m/s
+SWING_DRIVE_WEIGHT = 1.0
+SPRINT_SWING_SPEED = 2.0  # m/s relative to trunk; reference trace's ~90th percentile
+SPRINT_FOOT_CLEARANCE = 0.04  # m, bounded useful clearance, not unlimited lifting
 
 # Symmetry
 ENABLE_SYMMETRY = False
@@ -48,14 +54,14 @@ ENABLE_MASS_INERTIA_RANDOMIZATION = True  # Can enable once walking is stable
 ENABLE_JOINT_FRICTION_RANDOMIZATION = True  # Scales BAM's friction budget per-env via FrictionDRBamActuator.friction_scale
 ENABLE_JOINT_DAMPING_RANDOMIZATION = False
 ENABLE_ARMATURE_RANDOMIZATION = True  # Reflected rotor inertia (microban-style). DOES affect BAM (armature is set, not zeroed).
-ENABLE_VELOCITY_PUSHES = True  # Velocity-based pushes for robustness training
+ENABLE_VELOCITY_PUSHES = False  # Arena sprint has no external pushes
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True  # Simulates mounting errors
 ENABLE_ENCODER_BIAS = True  # Per-env joint encoder calibration offset (actor obs sees joint_pos + bias)
 ENABLE_BASE_ORIENTATION_RANDOMIZATION = False  # Randomize initial tilt to force reactive behavior
 
 # Head/body pose command tracking (replaces the old neck-offset disturbance scheme).
-# Head pose: 4D deltas-from-HOME on neck/head joints; vel env tracks these as a
-# primary objective. Body pose: 6D delta in [x, y, z, roll, pitch, yaw]; vel env
+# Head pose: 4D deltas-from-HOME on neck/head joints; vel env tracks these as an
+# auxiliary objective. Body pose: 6D delta in [x, y, z, roll, pitch, yaw]; vel env
 # samples small ranges + tiny reward weight so input neurons stay alive but
 # tracking isn't the priority (standup env raises the weight).
 HEAD_POSE_CMD_RESAMPLE_S = (2.0, 5.0)
@@ -111,8 +117,8 @@ from mjlab.managers import (
 )
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.rl import (
-    RslRlOnPolicyRunnerCfg,
     RslRlModelCfg,
+    RslRlOnPolicyRunnerCfg,
 )
 from mjlab.sensor import (
     ContactMatch,
@@ -125,11 +131,10 @@ from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
-
 from mjlab_microduck import challenge
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
-from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
+from mjlab_microduck.tasks.symmetry import SYMMETRY_CFG, PpoWithSymmetryCfg
 
 from . import rewards as sprint_rewards
 
@@ -167,11 +172,11 @@ def make_env_cfg(
 
     std_walking = {
         # Lower body
-        r".*hip_yaw.*": 0.3,
-        r".*hip_roll.*": 0.05,  # 0.1→0.06→0.05 — hold the 5°-inward stance, stop the leg splay to vertical
-        r".*hip_pitch.*": 0.4,
-        r".*knee.*": 0.4,
-        r".*ankle.*": 0.25, # was 0.15
+        r".*hip_yaw.*": 0.45,
+        r".*hip_roll.*": 0.18,  # allow lateral balance during large forward strides
+        r".*hip_pitch.*": 0.7,
+        r".*knee.*": 0.7,
+        r".*ankle.*": 0.5,
     }
 
     site_names = ["left_foot", "right_foot"]
@@ -221,6 +226,8 @@ def make_env_cfg(
 
     # Base configuration
     cfg = make_velocity_env_cfg()
+    if not ENABLE_VELOCITY_PUSHES:
+        cfg.events.pop("push_robot", None)  # also remove any inherited base event
 
     # Robot setup
     cfg.scene.entities = {"robot": MICRODUCK_WALK_ROBOT_CFG}
@@ -246,7 +253,7 @@ def make_env_cfg(
         "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",)
     )
     cfg.rewards["pose"].params["walking_threshold"] = 0.01
-    cfg.rewards["pose"].weight = 1.0
+    cfg.rewards["pose"].weight = 0.5  # do not tax the reference-sized stride envelope
 
     # Body-specific reward configurations
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
@@ -287,24 +294,45 @@ def make_env_cfg(
     )
 
 
-    # Keep the [0.125, 0.300] s window but only pay for productive forward
-    # motion. The TOML step_reward knob still sets this term's weight.
-    # NOTE: standing still at zero command is
-    # taught by the standing_envs curriculum (→25% standing envs by ~iter 2000),
-    # not by an explicit stillness/no-stepping term.
+    # Shorter swing window for fast cadence. Only pay productive airborne feet
+    # while another foot supports the duck; flight remains allowed but unpaid.
+    # The TOML step_reward knob still sets this term's weight. Keep a small
+    # standing-practice fraction rather than making idle behavior the race goal.
     cfg.rewards["air_time"].func = sprint_rewards.productive_air_time
     cfg.rewards["air_time"].weight = knobs["step_reward"]
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    cfg.rewards["air_time"].params["threshold_min"] = 0.125
-    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    cfg.rewards["air_time"].params["threshold_min"] = 0.06
+    cfg.rewards["air_time"].params["threshold_max"] = 0.22
     cfg.rewards["air_time"].params["lateral_std"] = SPRINT_LATERAL_STD
+    cfg.rewards["air_time"].params["require_support"] = True
+
+    cfg.rewards["swing_drive"] = RewardTermCfg(
+        func=sprint_rewards.swing_drive,
+        weight=SWING_DRIVE_WEIGHT,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "height_sensor_name": foot_height_scan_cfg.name,
+            "swing_speed": SPRINT_SWING_SPEED,
+            "clearance": SPRINT_FOOT_CLEARANCE,
+            "lateral_std": SPRINT_LATERAL_STD,
+            "asset_cfg": SceneEntityCfg("robot", site_names=tuple(site_names), preserve_order=True),
+        },
+    )
 
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
 
-    # Velocity tracking rewards
-    cfg.rewards["track_linear_velocity"].weight = knobs["forward_reward"]
-    cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
+    # Preserve the TOML knob/log name, but replace exact command tracking: the
+    # fastest references move ~2.4 m/s at command 1.15. A Gaussian around 1.15
+    # would punish that speed. Dense signed progress keeps paying up to gain*vx.
+    cfg.rewards["track_linear_velocity"] = RewardTermCfg(
+        func=sprint_rewards.forward_progress,
+        weight=knobs["forward_reward"],
+        params={
+            "command_name": "twist", "speed_gain": SPRINT_SPEED_GAIN,
+            "lateral_std": SPRINT_LATERAL_STD,
+        },
+    )
     cfg.rewards["track_angular_velocity"].weight = 2.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
@@ -322,9 +350,9 @@ def make_env_cfg(
         params={"std": 0.4, "asset_cfg": SceneEntityCfg("robot")},
     )
 
-    # A dense speed incentive where Gaussian tracking is nearly zero (e.g.
-    # early training at high commands). Positive payouts are capped at the
-    # commanded speed and gated by upright/low-drift motion; reverse is negative.
+    # Small bootstrap incentive saturating at the unscaled command. The main
+    # speed objective above continues paying beyond that point; this term never
+    # penalises overspeed. Reverse remains negative in both terms.
     # Uses heading_hold's reference, never adds heading/velocity to actor inputs.
     cfg.rewards["forward_progress"] = RewardTermCfg(
         func=sprint_rewards.forward_progress,
@@ -333,14 +361,14 @@ def make_env_cfg(
     )
 
     # Action smoothness: stage-0 value; the action_rate_weight curriculum below
-    # ramps it -0.1 → -1.0 by iter 1500.
-    cfg.rewards["action_rate_l2"].weight = -0.1
+    # ramps it -0.05 → -0.3 by iter 1500: smooth, but allow fast leg reversals.
+    cfg.rewards["action_rate_l2"].weight = -0.05
 
     cfg.rewards["foot_clearance"].params["command_threshold"] = 0.01
-    cfg.rewards["foot_clearance"].params["target_height"] = 0.02  # Increased from 0.01 to penalize dragging
+    cfg.rewards["foot_clearance"].params["target_height"] = SPRINT_FOOT_CLEARANCE
 
     cfg.rewards["foot_swing_height"].params["command_threshold"] = 0.01
-    cfg.rewards["foot_swing_height"].params["target_height"] = 0.02  # Increased from 0.01 to force foot lifting
+    cfg.rewards["foot_swing_height"].params["target_height"] = SPRINT_FOOT_CLEARANCE
 
     # NOTE: no neck-only action-rate term — the shared action_rate_l2 sums over
     # ALL action dims (neck included), and head_pose_tracking below gives the
@@ -642,7 +670,7 @@ def make_env_cfg(
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
 
     # Head pose command (4D deltas from HOME, in joint order:
-    #   neck_pitch, head_pitch, head_yaw, head_roll). Tracked as a primary
+    #   neck_pitch, head_pitch, head_yaw, head_roll). Tracked as an auxiliary
     # reward — see "head_pose_tracking" added below. Ranges are small non-zero
     # (not zero) so the input neurons stay alive, and held there for the whole
     # run — the Arena commands no head motion, so there is no widening
@@ -685,14 +713,22 @@ def make_env_cfg(
         )
 
     # === Pose tracking rewards ===
-    # head_pose: primary objective in vel env — the whole point of the rewrite.
+    # Head pose is auxiliary to sprinting; keep broad pitch tolerance.
     # std=0.5 with per-joint Gaussian (see head_pose_tracking in mdp.py). Final
     # reward is the mean over 4 joints, so partial tracking is partial reward
     # (no all-or-nothing).
     cfg.rewards["head_pose_tracking"] = RewardTermCfg(
         func=microduck_mdp.head_pose_tracking,
-        weight=2.0,
+        weight=1.0,
         params={"command_name": "head_pose", "std": 0.5},
+    )
+    cfg.rewards["head_forward"] = RewardTermCfg(
+        func=sprint_rewards.head_forward_cost,
+        weight=-0.5,  # nonnegative cost: negative weight, never double-negate
+        params={
+            "command_name": "head_pose", "deadband": 0.15,
+            "asset_cfg": SceneEntityCfg("robot", joint_names=("head_yaw", "head_roll"), preserve_order=True),
+        },
     )
     # body_pose: infra kept intact but DISABLED (weight 0) — the obs slot and
     # command stay alive for envs that raise the weight (standup).
@@ -731,18 +767,18 @@ def make_env_cfg(
     cfg.scene.terrain.terrain_generator = None
 
     # action_rate weight ramp: gentle smoothing while the gait bootstraps, then
-    # tighten to -1.0 by iter 1500.
+    # tighten to -0.3 by iter 1500, below the motion-blocking old -1.0.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
             "reward_name": "action_rate_l2",
             "weight_stages": [
-                {"step": 0, "weight": -0.1},
-                {"step": 500 * NUM_STEPS_PER_ENV, "weight": -0.2},
-                {"step": 750 * NUM_STEPS_PER_ENV, "weight": -0.4},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -0.6},
-                {"step": 1250 * NUM_STEPS_PER_ENV, "weight": -0.8},
-                {"step": 1500 * NUM_STEPS_PER_ENV, "weight": -1.0},
+                {"step": 0, "weight": -0.05},
+                {"step": 500 * NUM_STEPS_PER_ENV, "weight": -0.075},
+                {"step": 750 * NUM_STEPS_PER_ENV, "weight": -0.1},
+                {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -0.15},
+                {"step": 1250 * NUM_STEPS_PER_ENV, "weight": -0.2},
+                {"step": 1500 * NUM_STEPS_PER_ENV, "weight": -0.3},
             ],
         },
     )
@@ -755,10 +791,10 @@ def make_env_cfg(
             "standing_stages": [
                 {"step": 0,           "rel_standing_envs": 0.02},
                 {"step": 500 * 24,    "rel_standing_envs": 0.05},
-                {"step": 750 * 24,    "rel_standing_envs": 0.1},
-                {"step": 1000 * 24,   "rel_standing_envs": 0.15},
-                {"step": 1500 * 24,   "rel_standing_envs": 0.2},
-                {"step": 2000 * 24,   "rel_standing_envs": 0.25},
+                {"step": 750 * 24,    "rel_standing_envs": 0.05},
+                {"step": 1000 * 24,   "rel_standing_envs": 0.05},
+                {"step": 1500 * 24,   "rel_standing_envs": 0.05},
+                {"step": 2000 * 24,   "rel_standing_envs": 0.05},
             ],
         },
     )

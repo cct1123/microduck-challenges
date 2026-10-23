@@ -4,25 +4,25 @@ event = "sprint-2m"
 task  = "Mjlab-Sprint2m-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # the first training, as is
+[recipe]                  # aggressive sprint candidate; local RTX 3060 recipe
 num_envs       = 2048
 max_iterations = 3000
-seed           = 1
+seed           = 2
 
 [params.forward_reward]
-label = "Follow the speed order"
+label = "Sprint forward (2.5x command target)"
 value = 5.0
 min   = 0.5
 max   = 5.0
 
 [params.upright_reward]
 label = "Stay upright"
-value = 1.0
+value = 1.5
 min   = 0.5
 max   = 5.0
 
 [params.step_reward]
-label = "Lift your feet"
+label = "Fast productive steps"
 value = 6.0
 min   = 0.0
 max   = 6.0

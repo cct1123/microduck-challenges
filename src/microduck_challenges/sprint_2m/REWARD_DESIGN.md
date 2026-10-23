@@ -1,136 +1,158 @@
-# Sprint reward candidate: productive stepping
+# Aggressive Sprint reward candidate
 
-## Status and scope
+## Status
 
-This is an implemented, integration-tested reward hypothesis, **not a trained or
-Arena-validated improvement**. It changes the training objective, not the policy
-architecture. Full training, multi-seed evaluation, and checkpoint selection remain
-necessary before claiming better racing.
+Implemented and integration-tested, **not yet demonstrated to train a faster
+policy**. The 3.0 m/s reward saturation is a design target, not an achieved
+speed. This is an intentionally combined speed/stride/head experiment rather
+than a causal one-setting ablation. Do not deploy it to physical hardware
+without separate actuator, impact, and sim-to-real validation.
 
-Reviewed files:
+## Reference inspection and research
 
-- `challenge.toml`: keep the live workshop recipe and its three weight knobs.
-- `env.py`: retain the existing training recipe; wire the two custom terms below.
-- `rewards.py`: absent in the original Sprint folder; now contains custom terms.
+The live Arena leaderboard's leading entries report 0.84 s, five finishes from
+five seeds, at command 1.15 m/s.[4] All three user-supplied ONNX files were also
+run through the installed Arena's complete speed sweep and finalist evaluation:
 
-No dependency, robot, task registration, actor observation, command range, PPO,
-randomisation, head curriculum, or action-smoothing changes are part of this
-candidate. All changes form one deliberately combined reward experiment.
+| Reference | SHA-256 prefix | Local mean time | Finishes | Best command |
+|---|---|---:|---:|---:|
+| `policy (2).onnx` | `df443e8aaa0b` | 0.84 s | 5/5 | 1.15 m/s |
+| `policy (1).onnx` | `3bd79f53654e` | 0.84 s | 5/5 | 1.15 m/s |
+| `policy.onnx` | `6eabd8527cbb` | 0.84 s | 5/5 | 1.15 m/s |
 
-## Review and research
+Their selected best traces are identical despite distinct file hashes. Treat
+this as one demonstrated behaviour, not three independent successful gaits.
+The stored traces give a mean sampled forward speed of 2.40063 m/s and a peak
+sampled speed of 3.35779 m/s. The head also moves substantially; these are not
+examples of a rigidly fixed head.
 
-The installed mjlab `track_linear_velocity` uses
-`exp(-(||v_xy-command_xy||^2 + v_z^2) / std^2)`, with `std^2 = 0.1` here.
-For a stationary upright robot, its unweighted values at commands 0.2, 0.6,
-and 1.2 m/s are approximately 0.67032, 0.02732, and 0.00000055739. High-command
-exploration therefore receives very little speed-tracking reward near rest.
-This is a property of the formula, not a diagnosis established from a trained
-rollout.
+Graph inspection found 512/256/128 neural layers plus lookup tables, signature
+comparisons, and a counter encoded through previous action slot 42 (head-roll
+output slot 8). A graph and its weights do not reveal the original reward or
+PPO recipe. This candidate does not copy the action tables, seed signatures,
+or encoded counter, and it does not claim to reproduce those policy designs.
 
-The installed `feet_air_time` counts feet currently inside the 0.125–0.300 s
-air-time window. It gates on the command, not actual forward motion, so stepping
-in place can earn it. This differs from legged_gym's touchdown-based air-time
-term; copying weights or timings between implementations is not justified.[2]
+Forward kinematics of the selected trace, using the Arena model, gave foot
+height median 0.03729 m, 90th percentile 0.07222 m, and maximum 0.09765 m.
+Finite differences at the 50 Hz trace sampling gave absolute trunk-relative
+forward foot-speed 90th percentile 1.99599 m/s, with about 0.20 m relative
+forward excursion. These are coarse sampled diagnostics, not exact contact
+phase or peak instantaneous velocity measurements.
 
-Upstream MicroDuck guidance stresses penalty-sign checks, avoiding rewards for
-bad resting states, keeping motion-blocking regularisers modest, and not adding
-large early exploration taxes.[1] Rudin et al., section 3.2, use velocity tracking,
-undesired-axis controls, regularisation, and a step reward without prescribing a
-gait clock.[3] Those principles inform this candidate, but neither source
-validates the new formula or its chosen coefficients on MicroDuck.
+Machine-readable local evidence, with all three hashes, scans, and seed results:
+`logs/20261023_sprint_reference_analysis.json`.
 
-The challenge's own guide records a failed absolute `lane_hold` position reward.
-This candidate does **not** reintroduce that term: it uses instantaneous lateral
-velocity in the spawn-heading frame, not lateral displacement or wall distance.
-It cannot directly pull a duck back toward lane centre once an offset exists.
+Upstream MicroDuck guidance stresses correct penalty signs, avoiding rewards
+for bad resting states, allowing motion required by a dynamic skill, and
+introducing smoothing cautiously.[1] Rudin et al., section 3.2, combine velocity
+objectives, undesired-axis controls, regularisation, and step rewards without
+prescribing a gait clock.[3] Installed mjlab air time counts currently airborne
+feet inside a time window; legged_gym instead pays its air-time term on contact,
+so the implementations' coefficients are not interchangeable.[2]
 
-## New objective
+## Changes in the three files
 
-Let `v_cmd` be the positive commanded speed. Rotate world horizontal velocity
-into the spawn-heading frame to obtain `v_forward` and `v_side`. Reuse the
-reference owned by the retained `heading_hold` reward. For rows at their first
-step after reset, use current yaw as that upstream reward does; do not mutate its
-reference or depend on reward evaluation order.
+### challenge.toml
 
-Define:
+- Parallel environments: 2048; iterations: 3000; training seed: 2.
+- Forward weight: 5.0; upright weight: 1.5; productive-step weight: 6.0.
+- Existing knob identifiers and allowed min/max ranges are retained.
+- Labels now describe sprint intensity and productive steps.
 
-- `p = clip(v_forward / v_cmd, -1, 1)`;
-- `u = clip((-gravity_z - 0.5) / 0.5, 0, 1)`;
-- `q = u * exp(-(v_side / 0.2)^2)`;
-- `forward_progress = p*q` when `p > 0`, otherwise `p`;
-- `productive_air_time = stock_air_time * max(forward_progress, 0)`.
+The workshop Settings form can overwrite the file. Reload it and check the
+seed and values before starting another training. An already-running process
+uses its loaded configuration, not these edits.
 
-Both terms are zero for idle/non-forward commands. Non-finite robot/command
-state gets no new payout; existing NaN termination and manager guards remain.
-The scale parameters must be finite and positive.
+### rewards.py
 
-### Wiring in env.py
+**Dense sprint speed.** Rotate horizontal world velocity into the spawn-heading
+frame. For the main speed term, define
+`p = clip(v_forward / (2.5 * command_vx), -1, 1)`.
+Positive progress is multiplied by
+`clip((-gravity_z - 0.5)/0.5, 0, 1) * exp(-(v_side/0.2)^2)`.
+Reverse progress remains negative rather than hiding behind an upright gate.
+Idle/non-forward commands and invalid state produce no payout.
 
-| Term | Configuration |
-|---|---|
-| Existing speed tracking | Unchanged; weight remains `forward_reward` from TOML |
-| New `forward_progress` | Weight 0.5; independent of the TOML tracking knob |
-| Existing `air_time` name | Function replaced with `productive_air_time`; weight remains `step_reward` |
-| Existing upright | Unchanged; weight remains `upright_reward` |
-| Heading, collision, limits, slip, head, smoothness | Unchanged |
+The 2.5 gain makes the reward saturation 0.5–3.0 m/s across the required
+0.20–1.20 command sweep. Unlike exact Gaussian command tracking, the term does
+not penalise a 2.4 m/s sprint at command 1.15. A separate small weight-0.5
+bootstrap term still saturates at the unscaled command and never penalises
+higher speed. These are bounded velocity-rate objectives, not potential-based
+shaping; policy invariance or general immunity to reward hacking is not claimed.
 
-Positive forward bonus is bounded at 0.5 before the manager's timestep scaling.
-The bonus gives no extra payout for exceeding the command. Reverse motion stays
-negative even when tilted or drifting, rather than allowing a bad-pose gate to
-hide reverse travel. Air time still ranges from zero to two qualifying feet,
-with productive motion attenuating rather than increasing that range.
+**Productive air time.** Retain the TOML-controlled `air_time` term, shorten its
+window to 0.06–0.22 s, and require another foot's ground contact. Only the
+non-contact foot inside the window is counted. Forward progress, low lateral
+velocity, and upright posture gate its positive payout. Flight phases are
+permitted but do not earn the stepping bonus.
 
-No actor gets position, heading, or true linear velocity. These quantities are
-training-only reward information; the actor remains 61D with 14 joint targets.
+**Forward swing drive.** Reward forward foot velocity relative to the trunk,
+not translation of a frozen leg. Saturate at 2.0 m/s relative swing speed and
+0.04 m clearance, require another foot's support, and gate on productive
+forward travel. The term is bounded in [0,1], with weight 1.0. Stance sliding,
+backward swings, stepping in place, and unsupported flailing do not earn it.
+Selector order is explicitly left foot then right foot to match the sensor.
 
-## Risks and acceptance criteria
+**Forward-facing head.** A nonnegative, capped yaw/roll misalignment cost uses
+selected joint names, actor-view encoder positions, and the head command. A
+0.15 rad deadband allows normal movement. Weight is -0.5, because the function
+returns a positive cost. Pitch is deliberately not locked by this new term;
+existing broad head tracking and slow head-bias correction remain. This means
+head forward relative to the body, with body heading held separately—not a
+new world-fixed camera-gaze controller.
 
-- Multiplying the step reward by progress may delay initial stepping. This is
-  why the standalone, low-weight progress term remains active from the start.
-- The lateral scale 0.2 m/s and bonus weight 0.5 are engineering choices, not
-  literature-derived optima. A stricter gate could suppress useful exploration.
-- The candidate does not prevent hopping or sliding by itself. Existing foot,
-  posture, collision, and limit terms remain responsible for gait quality.
-- This is bounded rate shaping, **not** potential-based shaping; there is no
-  policy-invariance or general anti-reward-hacking guarantee.
-- Existing random pushes and sensor randomisation are retained for isolation,
-  although the Arena does not apply all these disturbances.
+### env.py
 
-Compare against the previous reward functions at the same environment count,
-weights, seed, and iteration budget. To ablate this package, restore the stock
-`mdp.feet_air_time` function and remove its `lateral_std` parameter, and omit the
-`forward_progress` term. Do not change PPO or curriculum at the same time.
-Evaluate every checkpoint using the Arena evaluator. Prefer 5/5 finishes, then
-lower mean time. Recheck a promising result with a second training seed. A
-higher total training reward is not acceptance evidence.
+- Replace `track_linear_velocity`'s Gaussian with dense gain-2.5 progress while
+  preserving its log name and TOML `forward_reward` connection.
+- Add supported swing drive and head-forward cost; wire supported air time.
+- Widen walking pose tolerances and reduce pose weight from 1.0 to 0.5, allowing
+  larger hip/knee/ankle motion without changing physical joint limits.
+- Raise clearance targets from 0.02 to 0.04 m.
+- Reduce action-rate smoothing schedule from -0.1→-1.0 to -0.05→-0.3.
+- Keep standing practice at 2–5% rather than increasing it to 25%.
+- Disable random velocity pushes for this no-push race; remove any inherited
+  push event, not merely the local toggle. Other randomisation remains.
+- Reduce broad head-pose tracking weight from 2.0 to 1.0; retain its 0.5 rad
+  tolerance and existing slow bias curriculum rather than tightening pitch.
 
-## Verification performed
+Robot, 61D actor/14D actions, network, PPO, command slots/sweep, heading_hold,
+critic-only heading error, collision/limit costs, and NaN guards remain intact.
+No imported ONNX model is used as a checkpoint or silently converted to PPO.
 
-- Baseline suite before code changes: 66 passed.
-- Added tests using observed RED-to-GREEN cycles for progress, spawn-frame
-  direction, gating, air-time integration, environment wiring, and scale checks.
-- Full suite after implementation: 91 passed, including 25 new cases and explicit
-  CPU/CUDA full-output comparison of the custom reward functions.
-- CPU/CUDA comparison checks device, shape, dtype, finiteness, and all elements
-  at `rtol=1e-5, atol=1e-6`. This is reward-function parity, not full-training
-  parity or a GPU throughput benchmark.
-- CPU smoke training: two environments, two updates, explicit seed 2; exit 0.
-  Both updates ran, 61D actor/14D action contract was reported, an ONNX policy
-  was exported, and `nan_state` termination metrics were zero.
-- Exported smoke policy executed in ONNX Runtime on CPU: input shape [1, 61],
-  output shape [1, 14], all outputs finite. All 47 logged TensorBoard scalar
-  tags were checked for finiteness and passed.
-- Smoke log: `logs/sprint_productive_smoke.log`.
-- Smoke snapshot: tracking/upright/step weights 3/2/3. During this work, an
-  external edit changed live TOML values to 5/1/6 and recipe seed 1. Those edits
-  were preserved. The smoke result must not be attributed to that newer setup.
-- CPU smoke deliberately hides CUDA; Warp reports unavailable CUDA at startup
-  and then completes on CPU. The existing actuator-selector warning remains.
+## Verification and limits
 
-No full training, Arena submission, publication, commit, or push was performed.
+- Full suite: 104 passed, including tests of speed gain, reverse/caps, frame and
+  reset handling, support gating, relative foot drive, head selectors/commands,
+  invalid state/scales, and TOML-to-environment wiring.
+- Explicit CPU/CUDA full-output comparisons exercise the custom rewards at
+  `rtol=1e-5, atol=1e-6`, checking device, shape, dtype, and finiteness. This is
+  reward-function parity, not full-training parity or a throughput benchmark.
+- Two-environment, two-update CPU smoke training at seed 2 completed and exported
+  ONNX. ONNX Runtime CPU inference accepted [1,61] and returned finite [1,14].
+- All 49 smoke TensorBoard scalar tags were finite; checked penalty terms had
+  no positive sign violations. The existing actuator-selector warning remains.
+- Ruff checks pass for the changed Python files; `git diff --check` passes.
+- Final smoke evidence: `logs/sprint_aggressive_final_smoke.log` and
+  `logs/20261023_sprint_aggressive_verification.json`.
+
+This candidate may destabilise early learning or overfit simulation. The 2.5
+speed gain, shorter air-time window, and reward weights are engineering choices,
+not coefficients validated by the papers or the reference policies. The new
+support bonuses may favour walking over a beneficial flight phase. Low drift
+velocity does not directly recenter a duck already offset in the lane.
+
+Acceptance remains Arena evaluation of every checkpoint, prioritising 5/5
+finishes and then lower mean time. Recheck promising results with another
+training seed. Compare this whole package against the previous recipe at the
+same budget; component ablations are needed to identify which changes help.
+No full training, submission, publication, commit, or push was launched by this
+implementation work. Any training started independently in the workshop is
+left untouched.
 
 ## Sources
 
 [1] https://raw.githubusercontent.com/pollen-robotics/microduck_rl/develop/AGENTS.md
 [2] https://github.com/leggedrobotics/legged_gym/blob/master/legged_gym/envs/base/legged_robot.py
 [3] https://arxiv.org/html/2109.11978v3
+[4] https://pollen-robotics-microduck-arena.hf.space/api/events/sprint-2m/leaderboard
