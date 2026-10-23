@@ -1,4 +1,9 @@
-"""The 2 m Sprint's training environment: Microduck walking on flat ground.
+"""The 2 m Sprint's training environment: a finite, gait-free timed race.
+
+The final configure_race call replaces the inherited walker reward stack below.
+Only elapsed race time and Arena-style failure cost determine complete-episode
+return; retained guidance is terminal-corrected potential shaping. All 14 servo
+outputs remain free, with the original robot's physical limits unchanged.
 
 A complete copy of microduck_rl's velocity task (microduck_velocity_env_cfg.py),
 made the sprint's own: flat ground only, and the three rewards a novice tunes
@@ -137,6 +142,7 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import SYMMETRY_CFG, PpoWithSymmetryCfg
 
 from . import rewards as sprint_rewards
+from .rewards import configure_race
 
 
 def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -881,7 +887,9 @@ def make_env_cfg(
         },
     )
 
-    return cfg
+    # Keep the robot/sensors/observation contract, but replace the walker reward
+    # stack with a finite first-passage race. No additive gait/style taxes survive.
+    return configure_race(cfg, knobs)
 
 
 RL_CFG = RslRlOnPolicyRunnerCfg(
@@ -891,8 +899,10 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         obs_normalization=True,
         distribution_cfg={
             "class_name": "GaussianDistribution",
-            "init_std": 1.0,
-            "std_type": "scalar",
+            # Broader joint-target exploration for neck/head and both legs.
+            # This is sampling noise, not extra torque or a larger physical range.
+            "init_std": 1.25,
+            "std_type": "scalar",  # independent learned std for each of 14 outputs
         },
     ),
     critic=RslRlModelCfg(
@@ -904,12 +914,12 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=0.02,  # stronger exploration pressure; no reward for flailing
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,
         schedule="adaptive",
-        gamma=0.99,
+        gamma=1.0,  # finite race: optimise seconds, not discounted survival
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,

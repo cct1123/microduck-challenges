@@ -78,12 +78,14 @@ def test_walking_training_reaches_the_top_of_the_sweep(folder):
 
 
 @pytest.mark.parametrize("folder", ["sprint_2m", "hill_climb_1m5"])
-def test_walking_races_train_to_hold_their_heading(folder):
-    # The Arena commands yaw 0 and never tells the actor its heading, so a drift
-    # into the lane's wall is only priced by heading_hold; the critic sees what
-    # it prices, the actor only what the Arena feeds it.
+def test_walking_races_keep_heading_privileged_with_task_specific_guidance(folder):
+    # Sprint deliberately frees yaw; hill climb retains heading guidance.
+    # Neither policy gains a heading observation unavailable in the Arena.
     cfg = importlib.import_module(f"microduck_challenges.{folder}.env").make_env_cfg()
-    assert cfg.rewards["heading_hold"].weight > 0
+    if folder == "sprint_2m":
+        assert cfg.rewards["heading_hold"].weight == 0
+    else:
+        assert cfg.rewards["heading_hold"].weight > 0
     assert "heading_error" in cfg.observations["critic"].terms
     assert "heading_error" not in cfg.observations["actor"].terms
 
