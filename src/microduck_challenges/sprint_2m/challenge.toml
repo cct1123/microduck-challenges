@@ -5,7 +5,7 @@ task  = "Mjlab-Sprint2m-MicroDuck"
 kind  = "perpetual"
 
 [recipe]                  # the first training, as is
-num_envs       = 4096
+num_envs       = 128
 max_iterations = 3000
 seed           = 1
 
