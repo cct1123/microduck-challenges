@@ -210,7 +210,7 @@ def make_env_cfg(
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
-    cfg.rewards["action_rate_l2"].weight = -1.0
+    cfg.rewards["action_rate_l2"].weight = -0.5
 
     cfg.rewards["com_height_target"] = RewardTermCfg(
         func=microduck_mdp.com_height_target,
@@ -582,19 +582,19 @@ def make_env_cfg(
     del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
-    # action_rate penalty raised (-0.5/-0.8/-1.0 -> -1.0/-1.5/-2.0) for a CALMER
-    # gait: this is the main "less movement" lever — it penalises fast/large action
-    # changes, so motions become smaller, smoother AND less frequent (rapid
-    # alternation = big action change = penalised). Dial back if it gets sluggish
-    # / can't push enough to move.
+    # Let the policy discover a propulsive stroke before charging the full
+    # action-change cost. Keep the final smoothing strength for stable skating,
+    # but introduce it at iteration 2000 rather than 500. This schedule assumes
+    # the unchanged 24 rollout steps per iteration; it is a tuning hypothesis.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
             "reward_name": "action_rate_l2",
             "weight_stages": [
-                {"step": 0, "weight": -1.0},
-                {"step": 250 * 24, "weight": -1.5},
-                {"step": 500 * 24, "weight": -2.0},
+                {"step": 0, "weight": -0.5},
+                {"step": 500 * 24, "weight": -1.0},
+                {"step": 1000 * 24, "weight": -1.5},
+                {"step": 2000 * 24, "weight": -2.0},
             ],
         },
     )
@@ -653,10 +653,10 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.03,  # roller-specific: higher exploration than the walk envs
+        entropy_coef=0.02,  # retain exploration while reducing sustained action jitter
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=5.0e-4,  # gentler initial updates; KL-adaptive schedule retained
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
