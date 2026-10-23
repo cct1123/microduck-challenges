@@ -23,12 +23,18 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
   - heading_hold: the Arena commands yaw 0 and never tells the policy its
     heading, so walking straight is priced on the yaw angle; the critic
     alone sees that heading error
+  - productive stepping: a small bounded spawn-frame progress reward, with
+    air-time payouts coupled to upright, low-drift forward motion
 """
 
 import math
 from copy import deepcopy
 
 NUM_STEPS_PER_ENV = 24
+
+# Sprint reward candidate: keep these small and compare by Arena finishes/time.
+FORWARD_PROGRESS_WEIGHT = 0.5
+SPRINT_LATERAL_STD = 0.2  # m/s, a soft velocity gate, NOT a lane-position target
 
 # Symmetry
 ENABLE_SYMMETRY = False
@@ -124,6 +130,8 @@ from mjlab_microduck import challenge
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
+
+from . import rewards as sprint_rewards
 
 
 def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -279,13 +287,17 @@ def make_env_cfg(
     )
 
 
-    # air_time window [0.125, 0.300] s. NOTE: standing still at zero command is
+    # Keep the [0.125, 0.300] s window but only pay for productive forward
+    # motion. The TOML step_reward knob still sets this term's weight.
+    # NOTE: standing still at zero command is
     # taught by the standing_envs curriculum (→25% standing envs by ~iter 2000),
     # not by an explicit stillness/no-stepping term.
+    cfg.rewards["air_time"].func = sprint_rewards.productive_air_time
     cfg.rewards["air_time"].weight = knobs["step_reward"]
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
     cfg.rewards["air_time"].params["threshold_min"] = 0.125
     cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    cfg.rewards["air_time"].params["lateral_std"] = SPRINT_LATERAL_STD
 
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
@@ -308,6 +320,16 @@ def make_env_cfg(
         func=microduck_mdp.heading_hold_reward,
         weight=1.0,
         params={"std": 0.4, "asset_cfg": SceneEntityCfg("robot")},
+    )
+
+    # A dense speed incentive where Gaussian tracking is nearly zero (e.g.
+    # early training at high commands). Positive payouts are capped at the
+    # commanded speed and gated by upright/low-drift motion; reverse is negative.
+    # Uses heading_hold's reference, never adds heading/velocity to actor inputs.
+    cfg.rewards["forward_progress"] = RewardTermCfg(
+        func=sprint_rewards.forward_progress,
+        weight=FORWARD_PROGRESS_WEIGHT,
+        params={"command_name": "twist", "lateral_std": SPRINT_LATERAL_STD},
     )
 
     # Action smoothness: stage-0 value; the action_rate_weight curriculum below
