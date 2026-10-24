@@ -26,3 +26,22 @@ label = "Lift your feet"
 value = 3.0
 min   = 0.0
 max   = 6.0
+
+# Keep the baseline until competent. For a separately launched fine-tune, set
+# stage = "speed" or prefix train with MICRODUCK_SPRINT_STAGE=speed.
+# The speed stage selects the fastest compatible saved 5/5 baseline result;
+# it refuses to train from scratch or silently choose the latest checkpoint.
+[training]
+stage = "baseline"
+
+[training.speed]
+# Provenance: 6ac3c45; fastest saved 5/5 is model_750.pt, 2.588 s at 0.90 m/s.
+# Preserve that run's 77D critic and productive-airtime/progress guidance.
+source_run = "2026-10-23_01-11-14_run-1023-0109"
+max_iterations = 600     # NEW updates, not the baseline's iteration number
+save_interval = 25
+learning_rate = 0.0001   # fixed; do not restore the baseline optimizer/LR
+hold_iterations = 50     # retain learned regularization before the gradual ramp
+ramp_iterations = 350
+forward_reward = 5.0     # command-independent body-forward tanh reward, 0 -> 5
+vel_ref = 1.5            # reward scale in m/s, not an achieved/commanded speed

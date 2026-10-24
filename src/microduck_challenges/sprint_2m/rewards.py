@@ -1,6 +1,6 @@
-"""Reference locomotion configuration and legacy Sprint checkpoint helpers.
+"""Reference locomotion, opt-in speed fine-tuning and Sprint checkpoint selection.
 
-Only configure_reference_locomotion is selected by the current env factory.
+The baseline stays the default; the speed stage requires a compatible 5/5 policy.
 The former race functions remain importable for saved experiment configurations;
 their clock, mastery gate and terminal costs are not active in the new recipe.
 """
@@ -8,14 +8,20 @@ their clock, mastery gate and terminal costs are not active in the new recipe.
 from __future__ import annotations
 
 import inspect
+import json
 import math
+import re
+from dataclasses import asdict
+from pathlib import Path
 
 import mujoco
 import torch
+import yaml
 from mjlab.managers import CurriculumTermCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.velocity import mdp
 from mjlab_microduck.tasks import mdp as microduck_mdp
+from rsl_rl.algorithms import PPO
 
 DISTANCE_M = 2.0
 TIME_LIMIT_S = 50.0
@@ -26,6 +32,7 @@ TIME_COST_WEIGHT = 0.1
 MASTERY_FINISH_RATE = 0.8
 MASTERY_MIN_EPISODES = 32
 COMMAND_RESAMPLE_S = (SETTLE_S + TIME_LIMIT_S + 1.0,) * 2
+_DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
 def reference_critic_padding(env):
@@ -143,6 +150,300 @@ def configure_reference_locomotion(cfg, knobs, rollout_steps=24):
     cfg.observations["critic"].terms["race_state"] = ObservationTermCfg(
         func=reference_critic_padding,
     )
+    return cfg
+
+
+def forward_progress(
+    env,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    lateral_std: float = 0.2,
+    speed_gain: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Restore 6ac3c45's bounded, upright/low-drift spawn-frame progress."""
+    if not math.isfinite(lateral_std) or lateral_std <= 0.0:
+        raise ValueError("lateral_std must be finite and positive")
+    if not math.isfinite(command_threshold) or command_threshold <= 0.0:
+        raise ValueError("command_threshold must be finite and positive")
+    if not math.isfinite(speed_gain) or speed_gain <= 0.0:
+        raise ValueError("speed_gain must be finite and positive")
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    data = env.scene[asset_cfg.name].data
+    w, x, y, z = data.root_link_quat_w.unbind(-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    reference = torch.where(
+        env.episode_length_buf <= 1, yaw, getattr(env, "_heading_ref", yaw)
+    )
+    velocity = data.root_link_lin_vel_w
+    speed = reference.cos() * velocity[:, 0] + reference.sin() * velocity[:, 1]
+    sideways = -reference.sin() * velocity[:, 0] + reference.cos() * velocity[:, 1]
+    target = command[:, 0]
+    progress = (speed / (speed_gain * target.clamp_min(command_threshold))).clamp(-1.0, 1.0)
+    upright = ((-data.projected_gravity_b[:, 2] - 0.5) / 0.5).clamp(0.0, 1.0)
+    quality = upright * torch.exp(-torch.square(sideways / lateral_std))
+    reward = torch.where(progress > 0.0, progress * quality, progress)
+    valid = (
+        (target > command_threshold)
+        & torch.isfinite(command).all(dim=-1)
+        & torch.isfinite(velocity).all(dim=-1)
+        & torch.isfinite(data.root_link_quat_w).all(dim=-1)
+        & torch.isfinite(data.projected_gravity_b).all(dim=-1)
+        & torch.isfinite(reference)
+    )
+    return torch.where(valid, reward, 0.0)
+
+
+def productive_air_time(
+    env,
+    sensor_name: str,
+    threshold_min: float = 0.125,
+    threshold_max: float = 0.3,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    lateral_std: float = 0.2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Restore 6ac3c45's air-time window gated on productive forward motion."""
+    air_time = mdp.feet_air_time(
+        env,
+        sensor_name=sensor_name,
+        threshold_min=threshold_min,
+        threshold_max=threshold_max,
+        command_name=command_name,
+        command_threshold=command_threshold,
+    )
+    progress = forward_progress(
+        env,
+        command_name=command_name,
+        command_threshold=command_threshold,
+        lateral_std=lateral_std,
+        asset_cfg=asset_cfg,
+    ).clamp_min(0.0)
+    return air_time * progress
+
+
+def configure_0109_locomotion(cfg):
+    """Restore the selected run's reward guidance and original 77D critic."""
+    cfg.observations["critic"].terms.pop("race_state")
+    cfg.rewards["track_linear_velocity"].weight = 5.0
+    cfg.rewards["upright"].weight = 1.0
+    cfg.rewards["air_time"].func = productive_air_time
+    cfg.rewards["air_time"].weight = 6.0
+    cfg.rewards["air_time"].params["lateral_std"] = 0.2
+    cfg.rewards["forward_progress"] = RewardTermCfg(
+        func=forward_progress, weight=0.5,
+        params={"command_name": "twist", "lateral_std": 0.2},
+    )
+    return cfg
+
+
+class _ConfigLoader(yaml.SafeLoader):
+    """Read saved config structure without constructing Python objects."""
+
+
+def _config_tag(loader, suffix, node):
+    del suffix
+    if node.tag.startswith("tag:yaml.org,2002:python/name:"):
+        return node.tag.removeprefix("tag:yaml.org,2002:python/name:")
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    return loader.construct_scalar(node)
+
+
+_ConfigLoader.add_multi_constructor("tag:yaml.org,2002:python/", _config_tag)
+
+
+def _config_data(config):
+    return yaml.load(yaml.dump(asdict(config), sort_keys=False), Loader=_ConfigLoader)
+
+
+def select_sprint_checkpoint(log_root, *, run_pattern=".*", stage="any",
+                             expected_env=None, expected_agent=None):
+    """Choose the fastest verified 5/5 saved result, never the latest checkpoint.
+
+    Incomplete/corrupt results, missing artifacts and legacy race critics are
+    ineligible. Optional current configs make a training handoff fail closed on
+    observation, action, robot, physics or model/normalizer incompatibility.
+    This reads metadata only: it neither evaluates policies nor loads .pt files.
+    """
+    if stage not in ("any", "baseline", "speed"):
+        raise ValueError(f"Unknown source stage: {stage!r}")
+    pattern = re.compile(run_pattern)
+    root = Path(log_root).resolve()
+    wanted_env = _config_data(expected_env) if expected_env is not None else None
+    wanted_agent = _config_data(expected_agent) if expected_agent is not None else None
+    eligible = []
+    rejected = []
+    for run in sorted(root.iterdir()) if root.is_dir() else ():
+        if not run.is_dir() or not pattern.fullmatch(run.name):
+            continue
+        try:
+            source_env = yaml.load((run / "params/env.yaml").read_text(), Loader=_ConfigLoader)
+            source_agent = yaml.load((run / "params/agent.yaml").read_text(), Loader=_ConfigLoader)
+            provenance = json.loads((run / "provenance.json").read_text())
+            if not all(isinstance(doc, dict) for doc in (source_env, source_agent, provenance)):
+                raise ValueError("saved config/provenance must be mappings")
+            if provenance.get("task") != "Mjlab-Sprint2m-MicroDuck":
+                continue
+            if source_agent["experiment_name"] != "sprint_2m":
+                continue
+            critic_terms = source_env["observations"]["critic"]["terms"]
+            if not isinstance(critic_terms, dict):
+                raise ValueError("saved critic terms must be a mapping")
+            padding = critic_terms.get("race_state")
+            if padding is not None and padding["func"] != "microduck_challenges.sprint_2m.rewards.reference_critic_padding":
+                continue
+            if critic_terms["heading_error"]["func"] != "microduck_challenges.sprint_2m.env.heading_error":
+                continue
+            source_stage = "speed" if "speed_forward" in source_env["rewards"] else "baseline"
+            if stage != "any" and source_stage != stage:
+                continue
+            if wanted_env is not None:
+                # Managers concatenate in insertion order; dict equality alone
+                # accepts reordered observations/actions with the wrong semantics.
+                for group in ("actor", "critic"):
+                    if (list(source_env["observations"][group]["terms"])
+                            != list(wanted_env["observations"][group]["terms"])):
+                        raise ValueError(f"incompatible {group} observation order")
+                if list(source_env["actions"]) != list(wanted_env["actions"]):
+                    raise ValueError("incompatible action term order")
+                for key in ("observations", "actions", "sim", "decimation"):
+                    if source_env[key] != wanted_env[key]:
+                        raise ValueError(f"incompatible {key}")
+                if source_env["scene"]["entities"]["robot"] != wanted_env["scene"]["entities"]["robot"]:
+                    raise ValueError("incompatible robot")
+            if wanted_agent is not None:
+                for key in ("actor", "critic", "obs_groups", "clip_actions"):
+                    if source_agent[key] != wanted_agent[key]:
+                        raise ValueError(f"incompatible {key}")
+        except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as error:
+            rejected.append(f"{run.name}: {error}")
+            continue
+        for result_file in sorted((run / "workshop").glob("model_*.json")):
+            try:
+                result = json.loads(result_file.read_text())
+                number = result["checkpoint"]
+                if type(number) is not int or number < 0 or result_file.stem != f"model_{number}":
+                    raise ValueError("invalid checkpoint identifier")
+                artifact = run / f"model_{number}.pt"
+                if not artifact.is_file() or artifact.stat().st_size == 0:
+                    raise ValueError("missing/empty training checkpoint")
+                if result.get("error") or result.get("seeds_finished") != 5 or result.get("seeds_total") != 5:
+                    continue
+                seeds = result["per_seed"]
+                if (len(seeds) != 5 or any(type(s["seed"]) is not int for s in seeds)
+                        or {s["seed"] for s in seeds} != {1, 2, 3, 4, 5}):
+                    raise ValueError("expected exactly seeds 1–5")
+                if any(s["status"] != "finish" for s in seeds):
+                    continue
+                times = [s["time_s"] for s in seeds]
+                score = result["score"]
+                command = result["command_vx"]
+                if any(type(t) not in (int, float) or not math.isfinite(t) or not 0 < t <= TIME_LIMIT_S
+                       for t in [score, *times]):
+                    raise ValueError("invalid finish time")
+                if not math.isclose(score, sum(times) / 5, abs_tol=1e-6, rel_tol=1e-8):
+                    raise ValueError("score disagrees with five finished seed times")
+                if (type(command) not in (int, float) or not math.isfinite(command)
+                        or not 0.2 - 1e-8 <= command <= 1.2 + 1e-8):
+                    raise ValueError("invalid Sprint command")
+                eligible.append({
+                    "path": artifact, "result_path": result_file, "score": score,
+                    "command_vx": command, "checkpoint": number, "stage": source_stage,
+                    "source_env": source_env, "source_agent": source_agent,
+                })
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                rejected.append(f"{result_file}: {error}")
+    if not eligible:
+        details = "; ".join(rejected[-5:]) or "no complete 5/5 evaluations with compatible saved configs"
+        raise RuntimeError(f"No eligible Sprint checkpoint in {root}: {details}. Refusing a cold start.")
+    return min(eligible, key=lambda item: (item["score"], item["checkpoint"], str(item["path"])))
+
+
+class SprintSpeedPPO(PPO):
+    """Warm-start weights/normalizers, not the old optimizer or iteration clock."""
+
+    def load(self, loaded_dict, load_cfg=None, strict=True):
+        if load_cfg is None:
+            load_cfg = {"actor": True, "critic": True, "optimizer": False,
+                        "iteration": False, "rnd": False}
+            # Mjlab's runner restores this independently of load_iteration.
+            # Change the in-memory load payload only, never the source .pt file.
+            infos = loaded_dict.get("infos") or {}
+            loaded_dict["infos"] = {
+                **infos, "env_state": {**infos.get("env_state", {}), "common_step_counter": 0},
+            }
+        restored_iteration = super().load(loaded_dict, load_cfg, strict)
+        self._sprint_warm_started = bool(load_cfg.get("actor") and load_cfg.get("critic"))
+        return restored_iteration
+
+    def train_mode(self):
+        if not getattr(self, "_sprint_warm_started", False):
+            raise RuntimeError("The Sprint speed stage requires a loaded locomotion checkpoint.")
+        super().train_mode()
+
+
+def speed_reward_curriculum(env, env_ids, targets, hold_steps, ramp_steps):
+    """Blend live reward weights on the new stage's clock, on curriculum resets."""
+    del env_ids
+    fraction = min(1.0, max(0.0, (env.common_step_counter - hold_steps) / ramp_steps))
+    for name, (initial, final) in targets.items():
+        env.reward_manager.get_term_cfg(name).weight = initial + fraction * (final - initial)
+    return torch.tensor(fraction, device=env.device)
+
+
+def configure_speed_locomotion(cfg, settings, selected, rollout_steps=24):
+    """Fine-tune a competent legged policy without removing balance guidance."""
+    source = selected["source_env"]
+    source_steps = (selected["checkpoint"] + 1) * selected["source_agent"]["num_steps_per_env"]
+
+    def source_weight(name):
+        weight = source["rewards"][name]["weight"]
+        for curriculum in source["curriculum"].values():
+            params = curriculum["params"]
+            if params.get("reward_name") == name:
+                for entry in params.get("weight_stages", []):
+                    if source_steps > entry["step"]:
+                        weight = entry["weight"]
+        return weight
+
+    # Start at the selected policy's scheduled regularization, not a random
+    # beginner's -0.1 smoothing. Retain upright, heading, gait and fall guidance.
+    cfg.curriculum.pop("action_rate_weight", None)
+    cfg.curriculum.pop("head_pose_bias_weight", None)
+    cfg.curriculum.pop("standing_envs", None)
+    cfg.commands["twist"].rel_standing_envs = 0.0
+    targets = {}
+    for name, final in (
+        ("track_linear_velocity", 0.1 * source_weight("track_linear_velocity")),
+        ("action_rate_l2", max(source_weight("action_rate_l2"), -0.3)),
+        ("pose", 0.6 * source_weight("pose")),
+        ("head_pose_bias", source_weight("head_pose_bias") / 3),
+        ("body_ang_vel", 0.5 * source_weight("body_ang_vel")),
+        ("angular_momentum", 0.5 * source_weight("angular_momentum")),
+    ):
+        initial = source_weight(name)
+        cfg.rewards[name].weight = initial
+        targets[name] = (initial, final)
+    cfg.rewards["speed_forward"] = RewardTermCfg(
+        func=microduck_mdp.forward_speed_reward, weight=0.0,
+        params={"vel_ref": settings["vel_ref"], "asset_cfg": SceneEntityCfg("robot")},
+    )
+    targets["speed_forward"] = (0.0, settings["forward_reward"])
+    cfg.curriculum["speed_rewards"] = CurriculumTermCfg(
+        func=speed_reward_curriculum,
+        params={"targets": targets,
+                "hold_steps": settings["hold_iterations"] * rollout_steps,
+                "ramp_steps": settings["ramp_iterations"] * rollout_steps},
+    )
+    # Do not silently rewind mature CoM randomization when resetting PPO's clock.
+    for curriculum in cfg.curriculum.values():
+        for entry in curriculum.params.get("range_stages", []):
+            entry["step"] = max(-1, entry["step"] - source_steps)
     return cfg
 
 
@@ -473,3 +774,20 @@ def configure_race(cfg, knobs):
     cfg.actions["joint_pos"].clip = None
     cfg.actions["joint_pos"].scale = 1.0
     return cfg
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Select a saved Sprint policy by 5/5 finishes, then time")
+    parser.add_argument("command", choices=("select",))
+    parser.add_argument("--log-root", default="logs/rsl_rl/sprint_2m")
+    parser.add_argument("--run", default=".*", help="full-match run directory regex")
+    parser.add_argument("--stage", choices=("any", "baseline", "speed"), default="any")
+    args = parser.parse_args()
+    best = select_sprint_checkpoint(args.log_root, run_pattern=args.run, stage=args.stage)
+    print(json.dumps({
+        "checkpoint": str(best["path"]), "evaluation": str(best["result_path"]),
+        "stage": best["stage"], "seeds_finished": 5, "seeds_total": 5,
+        "score": best["score"], "command_vx": best["command_vx"],
+    }, indent=2))

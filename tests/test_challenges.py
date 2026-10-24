@@ -58,7 +58,7 @@ RACES = ["sprint_2m", "hill_climb_1m5", "roller_sprint_2m"]
 @pytest.mark.parametrize("folder", RACES)
 def test_training_covers_the_speeds_the_arena_commands(folder):
     env = importlib.import_module(f"microduck_challenges.{folder}.env")
-    cfg = env.make_env_cfg()
+    cfg = env.make_env_cfg(stage="baseline") if folder == "sprint_2m" else env.make_env_cfg()
     lin_vel_x = cfg.commands["twist"].ranges.lin_vel_x
     event = load_event(_contract(folder).event)
     assert lin_vel_x[0] <= event.sweep.lo
@@ -71,7 +71,7 @@ def test_walking_training_reaches_the_top_of_the_sweep(folder):
     # roller_sprint_2m is excluded: its top command is the robot's measured push
     # limit, not the Arena's sweep top (see roller_sprint_2m/env.py).
     env = importlib.import_module(f"microduck_challenges.{folder}.env")
-    cfg = env.make_env_cfg()
+    cfg = env.make_env_cfg(stage="baseline") if folder == "sprint_2m" else env.make_env_cfg()
     lin_vel_x = cfg.commands["twist"].ranges.lin_vel_x
     event = load_event(_contract(folder).event)
     assert lin_vel_x[1] >= event.sweep.hi
@@ -79,11 +79,14 @@ def test_walking_training_reaches_the_top_of_the_sweep(folder):
 
 @pytest.mark.parametrize("folder", ["sprint_2m", "hill_climb_1m5"])
 def test_walking_races_keep_heading_privileged_with_task_specific_guidance(folder):
-    # Sprint deliberately frees yaw; hill climb retains heading guidance.
-    # Neither policy gains a heading observation unavailable in the Arena.
-    cfg = importlib.import_module(f"microduck_challenges.{folder}.env").make_env_cfg()
+    # Sprint's dense baseline restores heading guidance, but never exposes
+    # privileged heading observations to its Arena-compatible actor.
+    env = importlib.import_module(f"microduck_challenges.{folder}.env")
+    cfg = env.make_env_cfg(stage="baseline") if folder == "sprint_2m" else env.make_env_cfg()
     if folder == "sprint_2m":
-        assert cfg.rewards["heading_hold"].weight == 0
+        assert cfg.rewards["heading_hold"].weight == 1.0
+        assert cfg.rewards["heading_hold"].func is microduck_mdp.heading_hold_reward
+        assert cfg.rewards["heading_hold"].params["std"] == 0.4
     else:
         assert cfg.rewards["heading_hold"].weight > 0
     assert "heading_error" in cfg.observations["critic"].terms
@@ -147,7 +150,8 @@ def test_the_robot_matches_the_events_rig(folder):
     # One robot per rig. A legs challenge may use the standup variant, which is the
     # same robot with the collision set a seated trunk needs (next test).
     env = importlib.import_module(f"microduck_challenges.{folder}.env")
-    robot = env.make_env_cfg().scene.entities["robot"]
+    cfg = env.make_env_cfg(stage="baseline") if folder == "sprint_2m" else env.make_env_cfg()
+    robot = cfg.scene.entities["robot"]
     expected = {
         "legs": (MICRODUCK_WALK_ROBOT_CFG, MICRODUCK_STANDUP_ROBOT_CFG),
         "rollers": (MICRODUCK_WALK_ROLLERS_ROBOT_CFG,),
@@ -198,7 +202,7 @@ def test_knobs_reach_the_config(folder, tmp_path, monkeypatch):
     monkeypatch.setattr(challenge, "params", lambda f: real_params(copy))
 
     env = importlib.import_module(f"microduck_challenges.{folder}.env")
-    cfg = env.make_env_cfg()
+    cfg = env.make_env_cfg(stage="baseline") if folder == "sprint_2m" else env.make_env_cfg()
     for knob, (term, value) in CHALLENGES[folder].items():
         if term is None:
             continue

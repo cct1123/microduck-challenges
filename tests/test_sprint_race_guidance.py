@@ -1,4 +1,4 @@
-"""Gait-free race guidance preserves the complete-episode time objective."""
+"""Explicit legacy race guidance, not the active dense locomotion recipe."""
 
 from types import SimpleNamespace
 
@@ -7,6 +7,14 @@ import torch
 
 import microduck_challenges  # noqa: F401
 from microduck_challenges.sprint_2m import rewards
+
+
+def _legacy_race_cfg():
+    from microduck_challenges.sprint_2m.env import make_env_cfg
+
+    return rewards.configure_race(make_env_cfg(stage="baseline"), {
+        "forward_reward": 2.0, "upright_reward": 2.0, "step_reward": 3.0,
+    })
 
 
 def test_air_time_allows_flight_without_heading_posture_or_speed_gates():
@@ -21,17 +29,24 @@ def test_air_time_allows_flight_without_heading_posture_or_speed_gates():
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("terminal_airborne", [False, True])
 def test_air_time_guidance_cannot_change_finish_or_failure_return(failed, terminal_airborne):
-    from microduck_challenges.sprint_2m.env import make_env_cfg
-
-    time_weight = make_env_cfg().rewards["race_time"].weight
+    cfg = _legacy_race_cfg()
+    time_cost = cfg.rewards["race_time"]
+    guidance = cfg.rewards["air_time"]
+    assert time_cost.func is rewards.race_time_cost
+    assert time_cost.weight == -0.1
+    assert guidance.func is rewards.PotentialDifference
+    assert guidance.params["potential"] is rewards.race_air_time_potential
     env = SimpleNamespace(num_envs=1, device="cpu", step_dt=0.02,
+        extras={"log": {}},
         scene={"feet_ground_contact": SimpleNamespace(
             data=SimpleNamespace(current_air_time=torch.zeros(1, 2)))},
         _sprint_race=SimpleNamespace(done=torch.zeros(1, dtype=torch.bool),
             steps=torch.tensor([26]), settle_steps=25,
             elapsed=torch.tensor([0.02]), failed=torch.tensor([False]),
-            timed_out=torch.tensor([False])))
-    term = rewards.PotentialDifference(None, env)
+            timed_out=torch.tensor([False]), time_scale=torch.ones(1)))
+    # Timed phase is fixed for this episode; discovery intentionally has no
+    # clock pressure. Exercise the actual configured potential and weights.
+    term = guidance.func(guidance, env)
     total = torch.zeros(1)
     for step, airborne in enumerate([False, True, True, terminal_airborne], start=1):
         env.scene["feet_ground_contact"].data.current_air_time[:] = 0.1 if airborne else 0.0
@@ -39,8 +54,8 @@ def test_air_time_guidance_cannot_change_finish_or_failure_return(failed, termin
         race.elapsed[:] = step * env.step_dt
         race.done[:] = step == 4
         race.failed[:] = failed and step == 4
-        total += (term(env, potential=rewards.race_air_time_potential)
-                  + time_weight * rewards.race_time_cost(env)) * env.step_dt
+        total += (guidance.weight * term(env, **guidance.params)
+                  + time_cost.weight * time_cost.func(env)) * env.step_dt
     torch.testing.assert_close(total, torch.tensor([-5.0 if failed else -0.008]))
     term.reset()
     assert term.previous.item() == 0.0
@@ -52,10 +67,15 @@ def _race_env(count=2):
         root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(count, 1),
         projected_gravity_b=torch.tensor([[0.0, 0.0, -1.0]]).repeat(count, 1),
     )
+    cfg = _legacy_race_cfg()
     env = SimpleNamespace(num_envs=count, device="cpu", step_dt=0.02,
+        extras={"log": {}},
         scene={"robot": SimpleNamespace(data=data)},
         episode_length_buf=torch.full((count,), 2000))
-    return env, data, rewards.RaceEpisode(None, env)
+    term = cfg.terminations["race_complete"]
+    assert term.func is rewards.RaceEpisode
+    assert term.time_out is False
+    return env, data, term.func(term, env)
 
 
 def test_race_settle_tracks_start_and_ignores_generic_episode_clock():

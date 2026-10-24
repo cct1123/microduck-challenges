@@ -1,4 +1,4 @@
-"""Small sustained head preference, with the real camera's optical convention."""
+"""Active head tracking and explicit legacy head-cost/camera coverage."""
 
 import math
 import re
@@ -14,12 +14,39 @@ from microduck_challenges.sprint_2m.env import make_env_cfg
 from microduck_challenges.sprint_2m import rewards
 
 
-def test_head_cost_is_small_direct_cost_with_ordered_named_selector():
-    cfg = make_env_cfg()
+def test_baseline_uses_soft_head_tracking_not_legacy_downward_head_cost():
+    from mjlab_microduck.tasks import mdp as microduck_mdp
+
+    cfg = make_env_cfg(stage="baseline")
+    assert "head_posture_cost" not in cfg.rewards
+    tracking = cfg.rewards["head_pose_tracking"]
+    assert tracking.func is microduck_mdp.head_pose_tracking
+    assert tracking.weight == 2.0
+    assert tracking.params == {"command_name": "head_pose", "std": 0.5}
+    assert cfg.commands["head_pose"].ranges == (
+        (-0.05, 0.05), (-0.05, 0.05), (-0.07, 0.07), (-0.015, 0.015),
+    )
+    assert cfg.rewards["head_pose_bias"].func is microduck_mdp.head_pose_bias_penalty
+    assert cfg.rewards["head_pose_bias"].weight == 0.0
+    assert cfg.curriculum["head_pose_bias_weight"].params["weight_stages"][-1] == {
+        "step": 1500 * 24, "weight": 3.0,
+    }
+    assert cfg.actions["joint_pos"].clip is None
+    assert cfg.actions["joint_pos"].scale == 1.0
+
+
+def test_legacy_race_head_cost_respects_budget_with_ordered_named_selector():
+    cfg = rewards.configure_race(make_env_cfg(stage="baseline"), {
+        "forward_reward": 2.0, "upright_reward": 2.0, "step_reward": 3.0,
+    })
     assert "head_posture_cost" in cfg.rewards
     term = cfg.rewards["head_posture_cost"]
     assert term.func is rewards.head_posture_cost
-    assert term.weight == -0.05
+    control_dt = cfg.decimation * cfg.sim.mujoco.timestep
+    posture_budget = 0.5 * rewards.TIME_COST_WEIGHT * control_dt / 5
+    assert term.weight == pytest.approx(-posture_budget / cfg.episode_length_s)
+    assert term.weight < 0
+    assert -term.weight * cfg.episode_length_s == pytest.approx(posture_budget)
     selector = term.params["asset_cfg"]
     assert selector.name == "robot"
     assert selector.joint_names == ("head_pitch", "head_yaw", "head_roll")

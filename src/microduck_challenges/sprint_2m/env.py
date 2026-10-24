@@ -1,4 +1,4 @@
-"""Sprint locomotion recovery, following electricshaka/MicroDuck's reference.
+"""Sprint locomotion recovery and opt-in warm-started speed specialization.
 
 Learn sustained balance and walking with dense reference rewards before tuning
 race speed. Training uses 20-second locomotion episodes, not the experimental
@@ -7,12 +7,19 @@ is intentional; all 14 actuator outputs and physical robot limits are unchanged.
 
 The actor remains Arena-compatible (61 observations). Four legacy critic slots
 are retained as zeros for checkpoint shape compatibility, not race state. Start
-this changed objective as a fresh run; matching shapes do not make old critic
-weights or normalizer statistics suitable for resuming it.
+the baseline as a fresh run; matching shapes do not make legacy race critics
+suitable. MICRODUCK_SPRINT_STAGE=speed instead selects a compatible saved 5/5
+policy automatically, preserving its weights and observation normalizers. The
+speed source profile restores run-1023-0109's 77D critic and reward guidance;
+the reference baseline retains its four zero critic padding slots.
 """
 
 import math
+import os
+import re
+import tomllib
 from copy import deepcopy
+from pathlib import Path
 
 NUM_STEPS_PER_ENV = 24
 POSE_COMMAND_RESAMPLE_S = (2.0, 5.0)
@@ -102,9 +109,30 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import SYMMETRY_CFG, PpoWithSymmetryCfg
 
-from .rewards import configure_reference_locomotion
+from .rewards import (
+    configure_0109_locomotion,
+    configure_reference_locomotion,
+    configure_speed_locomotion,
+    select_sprint_checkpoint,
+)
 
 TRAINING_RECIPE = challenge.load(__file__).recipe
+STAGE_SETTINGS = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
+TRAINING_STAGE = os.environ.get("MICRODUCK_SPRINT_STAGE", STAGE_SETTINGS["stage"])
+if TRAINING_STAGE not in ("baseline", "speed"):
+    raise ValueError(f"Unknown Sprint training stage: {TRAINING_STAGE!r}")
+SPEED_SETTINGS = STAGE_SETTINGS["speed"]
+SPEED_CHECKPOINT = None
+for _key in ("max_iterations", "save_interval", "hold_iterations", "ramp_iterations"):
+    _value = SPEED_SETTINGS[_key]
+    if type(_value) is not int or _value < (0 if _key == "hold_iterations" else 1):
+        raise ValueError(f"training.speed.{_key} must be a positive integer (hold may be zero)")
+for _key in ("learning_rate", "vel_ref", "forward_reward"):
+    _value = SPEED_SETTINGS[_key]
+    if type(_value) not in (int, float) or not math.isfinite(_value) or _value <= 0:
+        raise ValueError(f"training.speed.{_key} must be finite and positive")
+if SPEED_SETTINGS["hold_iterations"] + SPEED_SETTINGS["ramp_iterations"] > SPEED_SETTINGS["max_iterations"]:
+    raise ValueError("The speed reward ramp must fit within the speed-stage budget")
 
 
 def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -120,6 +148,7 @@ def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
 
 def make_env_cfg(
     play: bool = False,
+    *, stage: str | None = None,
 ) -> ManagerBasedRlEnvCfg:
     """The sprint's training environment."""
 
@@ -556,8 +585,18 @@ def make_env_cfg(
     del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
-    # Keep the reference's dense locomotion objective; judge speed with the Arena.
-    return configure_reference_locomotion(cfg, knobs, NUM_STEPS_PER_ENV)
+    # Baseline behavior is unchanged. A speed stage is a separately launched run.
+    cfg = configure_reference_locomotion(cfg, knobs, NUM_STEPS_PER_ENV)
+    active_stage = TRAINING_STAGE if stage is None else stage
+    if active_stage in ("speed", "source"):
+        cfg = configure_0109_locomotion(cfg)
+    if active_stage == "speed":
+        if SPEED_CHECKPOINT is None:
+            raise RuntimeError("Select a compatible 5/5 baseline before speed tuning")
+        cfg = configure_speed_locomotion(cfg, SPEED_SETTINGS, SPEED_CHECKPOINT, NUM_STEPS_PER_ENV)
+    elif active_stage not in ("baseline", "source"):
+        raise ValueError(f"Unknown Sprint environment stage: {active_stage!r}")
+    return cfg
 
 
 RL_CFG = RslRlOnPolicyRunnerCfg(
@@ -600,3 +639,24 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     num_steps_per_env=NUM_STEPS_PER_ENV,
     max_iterations=int(TRAINING_RECIPE["max_iterations"]),
 )
+
+if TRAINING_STAGE == "speed":
+    SPEED_CHECKPOINT = select_sprint_checkpoint(
+        Path("logs/rsl_rl/sprint_2m"),
+        run_pattern=SPEED_SETTINGS["source_run"], stage="baseline",
+        expected_env=make_env_cfg(stage="source"), expected_agent=RL_CFG,
+    )
+    _checkpoint_path = SPEED_CHECKPOINT["path"]
+    RL_CFG.resume = True
+    # Exact regexes prevent the generic runner from substituting the latest model.
+    RL_CFG.load_run = "^" + re.escape(_checkpoint_path.parent.name) + "$"
+    RL_CFG.load_checkpoint = "^" + re.escape(_checkpoint_path.name) + "$"
+    RL_CFG.run_name = "sprint_2m_speed"
+    RL_CFG.max_iterations = SPEED_SETTINGS["max_iterations"]
+    RL_CFG.save_interval = SPEED_SETTINGS["save_interval"]
+    RL_CFG.algorithm.class_name = "microduck_challenges.sprint_2m.rewards:SprintSpeedPPO"
+    RL_CFG.algorithm.learning_rate = SPEED_SETTINGS["learning_rate"]
+    RL_CFG.algorithm.schedule = "fixed"
+    print(f"[sprint speed] warm-start {_checkpoint_path}; "
+          f"5/5 in {SPEED_CHECKPOINT['score']:.3f}s at "
+          f"{SPEED_CHECKPOINT['command_vx']:.2f}m/s; fresh optimizer and stage clock")
