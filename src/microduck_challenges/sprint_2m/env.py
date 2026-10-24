@@ -3,7 +3,8 @@
 The race rewards are configured once by configure_race; no walker reward stack
 or posture/smoothing curriculum is applied.
 Discovery rewards reducing distance to the finish and legal completion, without
-clock pressure. Once finishing is established, new episodes optimise race time
+clock pressure; falls and invalid states pay a one-time terminal failure cost.
+Once finishing is established, new episodes optimise race time
 with terminal-corrected guidance and a tiny head-posture tie-breaker. All 14 servo
 outputs remain free, with the original robot's physical limits unchanged.
 Weak actor mirror consistency encourages bilateral control without prescribing

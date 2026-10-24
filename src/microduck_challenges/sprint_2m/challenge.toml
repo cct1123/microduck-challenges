@@ -10,7 +10,7 @@ max_iterations = 3000
 seed           = 2
 
 [params.forward_reward]
-label = "Reach the finish (distance first, then speed)"
+label = "Reach the finish safely (distance first, then speed)"
 value = 5.0
 min   = 0.5
 max   = 5.0

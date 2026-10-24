@@ -127,7 +127,8 @@ class DistanceProgress:
     """Pay reductions in distance-to-finish, not occupancy near the finish.
 
     Discovery retains terminal progress, so a farther unsuccessful attempt is
-    better than immediate collapse. Backtracking gives the credit back. Once
+    better than immediate collapse, but a separate failure cost keeps falls
+    net negative. Backtracking gives the credit back. Once
     the episode's time phase is enabled, terminal clawback restores zero-net
     shaping and lets race time, rather than partial-distance credit, rank it.
     """
@@ -152,6 +153,20 @@ def discovery_finish_bonus(env):
     """One terminal payout for a legal finish; no reward for a failed crossing."""
     race = env._sprint_race
     return race.finished.float() * (1.0 - race.time_scale) / env.step_dt
+
+
+def discovery_failure_cost(env):
+    """One terminal fall/invalid-state cost, not a clock or motion tax.
+
+    Weight this nonnegative rate by -2 * forward_reward. Since bounded progress
+    earns at most forward_reward and a failed crossing earns no finish bonus,
+    every fallen discovery episode has negative main return. Partial-distance
+    differences remain useful; a safe timeout keeps its progress credit.
+    The timed phase already charges the Arena's full failure score, so this
+    additional cost is disabled there rather than double-counting failure.
+    """
+    race = env._sprint_race
+    return race.failed.float() * (1.0 - race.time_scale) / env.step_dt
 
 
 class PotentialDifference:
@@ -257,10 +272,10 @@ def add_lane_walls(spec):
 def configure_race(cfg, knobs):
     """Replace walker incentives while preserving robot and policy contracts.
 
-    Forward guidance retains partial-distance credit during discovery, then
-    becomes zero-net shaping after finishing is established. Other guidance
-    remains zero-net. Head posture is only a small tie-breaker, not a reason
-    to choose a slower scored finish.
+    Forward guidance retains partial-distance credit during discovery, with
+    falls net negative, then becomes zero-net shaping after finishing is
+    established. Other guidance remains zero-net. Head posture is only a small
+    tie-breaker, not a reason to choose a slower scored finish.
     No effort, smoothing, joint-proximity, or swing tax remains. Physical
     actuator limits are unchanged; outputs are unclipped.
     """
@@ -282,6 +297,9 @@ def configure_race(cfg, knobs):
         ),
         "discovery_finish": RewardTermCfg(
             func=discovery_finish_bonus, weight=knobs["forward_reward"],
+        ),
+        "discovery_failure": RewardTermCfg(
+            func=discovery_failure_cost, weight=-2.0 * knobs["forward_reward"],
         ),
         "air_time": RewardTermCfg(
             func=PotentialDifference, weight=knobs["step_reward"],
