@@ -20,6 +20,7 @@ import re
 import tomllib
 from copy import deepcopy
 from pathlib import Path
+from dataclasses import asdict
 
 NUM_STEPS_PER_ENV = 24
 POSE_COMMAND_RESAMPLE_S = (2.0, 5.0)
@@ -118,6 +119,8 @@ from .rewards import (
     mark_actor_only_inference,
     select_sprint_checkpoint,
 )
+from .learning import SprintRefinePpoCfg, phase_settings
+from .promotion import require_promotion
 
 TRAINING_RECIPE = challenge.load(__file__).recipe
 STAGE_SETTINGS = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
@@ -126,12 +129,21 @@ if TRAINING_STAGE not in ("baseline", "speed", "drive", "refine"):
     raise ValueError(f"Unknown Sprint training stage: {TRAINING_STAGE!r}")
 SPEED_SETTINGS = STAGE_SETTINGS["speed"]
 DRIVE_SETTINGS = STAGE_SETTINGS["drive"]
-REFINE_SETTINGS = STAGE_SETTINGS["refine"]
+TRAINING_PHASE = os.environ.get("MICRODUCK_SPRINT_PHASE", STAGE_SETTINGS["phase"])
+REFINE_SETTINGS = {**STAGE_SETTINGS["refine"], **phase_settings(STAGE_SETTINGS, TRAINING_PHASE)}
+if _source_override := os.environ.get("MICRODUCK_SPRINT_SOURCE"):
+    _source_path = Path(_source_override)
+    _source_match = re.fullmatch(r"model_(0|[1-9][0-9]*)\.pt", _source_path.name)
+    if (TRAINING_STAGE != "refine" or not _source_path.is_absolute() or not _source_match
+            or _source_path.resolve().parent.parent != Path("logs/rsl_rl/sprint_2m").resolve()):
+        raise ValueError("Sprint source must be an exact absolute model_N.pt in the Sprint experiment")
+    REFINE_SETTINGS.update(source_run=_source_path.parent.name,
+                           source_checkpoint=int(_source_match[1]))
 SPEED_CHECKPOINT = None
 DRIVE_CHECKPOINT = None
 REFINE_CHECKPOINT = None
 for _stage in ("speed", "drive", "refine"):
-    _settings = STAGE_SETTINGS[_stage]
+    _settings = REFINE_SETTINGS if _stage == "refine" else STAGE_SETTINGS[_stage]
     for _key in ("max_iterations", "save_interval", "hold_iterations", "ramp_iterations"):
         _value = _settings[_key]
         if type(_value) is not int or _value < (0 if _key == "hold_iterations" else 1):
@@ -671,7 +683,14 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
 )
 
 if TRAINING_STAGE in ("speed", "drive", "refine"):
-    _settings = STAGE_SETTINGS[TRAINING_STAGE]
+    _settings = REFINE_SETTINGS if TRAINING_STAGE == "refine" else STAGE_SETTINGS[TRAINING_STAGE]
+    if TRAINING_STAGE == "refine" and TRAINING_PHASE == "exploit":
+        require_promotion(
+            os.environ.get("MICRODUCK_SPRINT_PROMOTION"),
+            Path("logs/rsl_rl/sprint_2m") / _settings["source_run"]
+            / f"model_{_settings['source_checkpoint']}.pt",
+            STAGE_SETTINGS["gate"],
+        )
     _selected = select_sprint_checkpoint(
         Path("logs/rsl_rl/sprint_2m"),
         run_pattern=re.escape(_settings["source_run"]),
@@ -696,7 +715,13 @@ if TRAINING_STAGE in ("speed", "drive", "refine"):
     RL_CFG.save_interval = _settings["save_interval"]
     RL_CFG.algorithm.class_name = "microduck_challenges.sprint_2m.rewards:SprintSpeedPPO"
     if TRAINING_STAGE == "refine":
-        RL_CFG.algorithm.class_name = "microduck_challenges.sprint_2m.rewards:SprintRefinePPO"
+        RL_CFG.algorithm = SprintRefinePpoCfg(
+            **{**asdict(RL_CFG.algorithm),
+               "class_name": "microduck_challenges.sprint_2m.rewards:SprintRefinePPO",
+               "entropy_coef": _settings["entropy_coef"],
+               "clip_param": _settings["clip_param"]},
+            exploration_std_scale=_settings["exploration_std_scale"],
+        )
     RL_CFG.algorithm.learning_rate = _settings["learning_rate"]
     RL_CFG.algorithm.schedule = "fixed"
     print(f"[sprint {TRAINING_STAGE} config] selected training source {_checkpoint_path}; "

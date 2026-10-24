@@ -26,6 +26,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.velocity import mdp
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from rsl_rl.algorithms import PPO
+from rsl_rl.modules.distribution import GaussianDistribution
 
 DISTANCE_M = 2.0
 TIME_LIMIT_S = 50.0
@@ -519,6 +520,20 @@ class SprintSpeedPPO(SprintPPO):
 class SprintRefinePPO(SprintSpeedPPO):
     """Fresh optimizer/runner iteration while preserving the source environment age."""
 
+    def __init__(self, *args, exploration_std_scale=1.0, **kwargs):
+        self.exploration_std_scale = self._noise_scale(exploration_std_scale)
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _noise_scale(value):
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 1:
+            raise ValueError("exploration_std_scale must be finite and in (0, 1]")
+        return float(value)
+
+    def save(self):
+        return {**super().save(),
+                "sprint_exploration_std_scale": getattr(self, "exploration_std_scale", 1.0)}
+
     def load(self, loaded_dict, load_cfg=None, strict=True):
         if getattr(self, "_sprint_inference_only", False):
             return super().load(loaded_dict, load_cfg, strict)
@@ -529,8 +544,19 @@ class SprintRefinePPO(SprintSpeedPPO):
         clock = (loaded_dict.get("infos") or {}).get("env_state", {}).get("common_step_counter")
         if type(clock) is not int or clock <= 0:
             raise ValueError("Refine requires the saved source environment clock")
+        target_scale = self._noise_scale(getattr(self, "exploration_std_scale", 1.0))
+        source_scale = self._noise_scale(loaded_dict.get("sprint_exploration_std_scale", 1.0))
         # An explicit load config bypasses SprintSpeedPPO's new-stage clock reset.
-        return super().load(loaded_dict, required, strict=True)
+        restored = super().load(loaded_dict, required, strict=True)
+        if target_scale != source_scale:
+            distribution = self.actor.distribution
+            if not isinstance(distribution, GaussianDistribution) or distribution.std_type != "scalar":
+                raise ValueError("Phase transitions require the known scalar Gaussian distribution")
+            with torch.no_grad():
+                distribution.std_param.mul_(target_scale / source_scale)
+            print(f"[sprint phase] restored training-noise scale {source_scale} -> {target_scale}; "
+                  "actor mean, normalizers and physical action range unchanged")
+        return restored
 
 
 def speed_reward_curriculum(env, env_ids, targets, hold_steps, ramp_steps, initial_fraction=0.0):
@@ -684,6 +710,10 @@ def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
         raise ValueError("Refine requires the saved source environment clock")
     if source_steps < params["hold_steps"] + params["ramp_steps"]:
         raise ValueError("Refine requires a fully-ramped source checkpoint")
+    declared_noise = selected["source_agent"]["algorithm"].get("exploration_std_scale", 1.0)
+    saved_noise = payload.get("sprint_exploration_std_scale", 1.0)
+    if SprintRefinePPO._noise_scale(saved_noise) != SprintRefinePPO._noise_scale(declared_noise):
+        raise ValueError("Incompatible saved noise phase and source agent configuration")
     cfg = _mature_refine_recipe(cfg, settings)
     return configure_leg_freedom(cfg) if free_legs else cfg
 

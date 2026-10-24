@@ -100,8 +100,8 @@ def test_default_refine_selects_latest_winner_not_original_baseline():
     selected = sprint_env.REFINE_CHECKPOINT
     assert selected["path"].parent.name == "2026-10-24_01-21-50_run-1024-0121"
     assert selected["checkpoint"] == 8250 and selected["stage"] == "speed"
-    assert RL_CFG.resume and RL_CFG.max_iterations == 10000
-    assert RL_CFG.seed == 2 and RL_CFG.save_interval == 250
+    assert RL_CFG.resume and RL_CFG.max_iterations == 500
+    assert RL_CFG.seed == 2 and RL_CFG.save_interval == 50
     assert RL_CFG.algorithm.learning_rate == 5e-5
     assert RL_CFG.algorithm.schedule == "fixed"
     assert RL_CFG.algorithm.class_name.endswith(":SprintRefinePPO")
@@ -559,8 +559,8 @@ def test_drive_lean_rejects_invalid_scales(key, value):
 def test_consolidation_budget_preserves_the_explicit_drive_recipe():
     from microduck_challenges.sprint_2m.env import DRIVE_SETTINGS, REFINE_SETTINGS, TRAINING_RECIPE
 
-    assert TRAINING_RECIPE["max_iterations"] == REFINE_SETTINGS["max_iterations"] == 10000
-    assert REFINE_SETTINGS["save_interval"] == 250
+    assert TRAINING_RECIPE["max_iterations"] == REFINE_SETTINGS["max_iterations"] == 500
+    assert REFINE_SETTINGS["save_interval"] == 50
     assert REFINE_SETTINGS["learning_rate"] == 0.00005
     assert DRIVE_SETTINGS["max_iterations"] == 1200
     assert DRIVE_SETTINGS["save_interval"] == 25

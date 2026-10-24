@@ -4,9 +4,9 @@ event = "sprint-2m"
 task  = "Mjlab-Sprint2m-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # next conservative continuation; no training launched here
+[recipe]                  # bounded exploration screen; no training launched here
 num_envs       = 2048
-max_iterations = 10000
+max_iterations = 500
 seed           = 2
 
 [params.forward_reward]
@@ -27,21 +27,44 @@ value = 6.0
 min   = 0.0
 max   = 6.0
 
-# The NEXT Workshop/CLI launch continues the latest 81D drive winner.
-# Refresh the Workshop recipe and use 10000 NEW iterations.
-# Fine-tune stages refuse a cold start and choose by saved 5/5 race time.
+# The normal Workshop/CLI launch explores from the retained 81D winner.
+# Refresh an already-open Workshop form: the next screen is 500 NEW updates.
+# Exploitation is a separate, explicitly gated launch; never an iteration timer.
 [training]
 stage = "refine"
+phase = "explore"
+
+[training.phases.explore]
+max_iterations = 500
+save_interval = 50
+learning_rate = 0.00005
+entropy_coef = 0.01
+clip_param = 0.2
+exploration_std_scale = 1.0
+
+[training.phases.exploit]
+max_iterations = 500
+save_interval = 50
+learning_rate = 0.00001
+entropy_coef = 0.001
+clip_param = 0.1
+exploration_std_scale = 0.5  # applied to restored noise only on a phase transition
+
+[training.gate]
+command_vx = 0.30          # frozen before evaluating candidates
+neighbor_checkpoints = 3
+heldout_first_seed = 6
+heldout_seed_count = 20
+goal_seconds = 0.8
+max_wall_minutes = 40     # cap each explicitly requested local run
 
 [training.refine]
-# Preserve source age and mature rewards while freeing the legs.
-free_legs = true
+# Preserve the source policy and environment age; free the legs for the next run.
+free_legs = true           # no leg pose reward or leg action-rate cost; head smoothing stays
 source_run = "2026-10-24_01-21-50_run-1024-0121"
-# Retained winner; never silently substitute the final model_9999.
+# Explicit winner; never silently substitute the final model_9999.
 source_checkpoint = 8250
-max_iterations = 10000
-save_interval = 250
-learning_rate = 0.00005
+# Budgets and PPO controls come only from training.phases.<phase> above.
 # Source drive construction scalars for strict semantic validation, not a new ramp.
 source_baseline_checkpoint = 2250
 hold_iterations = 50
