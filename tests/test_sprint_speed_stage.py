@@ -318,6 +318,43 @@ def test_drive_lean_rejects_invalid_scales(key, value):
         rewards.drive_upright(_drive_env(), **params)
 
 
+def test_drive_recipe_uses_1200_additional_updates_in_workshop_and_runner_defaults():
+    from microduck_challenges.sprint_2m.env import DRIVE_SETTINGS, TRAINING_RECIPE
+
+    assert TRAINING_RECIPE["max_iterations"] == 1200
+    assert DRIVE_SETTINGS["max_iterations"] == 1200
+    assert DRIVE_SETTINGS["save_interval"] == 25
+    assert DRIVE_SETTINGS["learning_rate"] == 0.0001
+
+
+def test_drive_recipe_ramps_a_strong_course_speed_reward_without_changing_safety():
+    from microduck_challenges.sprint_2m.env import DRIVE_SETTINGS
+
+    cfg = make_env_cfg(stage="baseline")
+    selected = {"source_env": rewards._config_data(cfg),
+                "source_agent": {"num_steps_per_env": 24}, "checkpoint": 2250}
+    cfg = rewards.configure_drive_locomotion(cfg, DRIVE_SETTINGS, selected)
+    params = cfg.curriculum["speed_rewards"].params
+    assert params["targets"]["speed_forward"] == (0.0, 12.0)
+    assert cfg.rewards["speed_forward"].params["vel_ref"] == 1.5
+    assert cfg.rewards["speed_forward"].weight == 0.0
+    assert cfg.rewards["heading_hold"].weight == 1.0
+    assert cfg.rewards["self_collisions"].weight == -1.0
+    assert params["hold_steps"] == 50 * 24 and params["ramp_steps"] == 200 * 24
+    terms = {name: SimpleNamespace(weight=initial) for name, (initial, _) in params["targets"].items()}
+    env = SimpleNamespace(common_step_counter=params["hold_steps"], device="cpu",
+                          reward_manager=SimpleNamespace(get_term_cfg=terms.__getitem__))
+    rewards.speed_reward_curriculum(env, None, **params)
+    assert terms["speed_forward"].weight == 0.0
+    env.common_step_counter += params["ramp_steps"] // 2
+    rewards.speed_reward_curriculum(env, None, **params)
+    assert terms["speed_forward"].weight == 6.0
+    env.common_step_counter += params["ramp_steps"] // 2
+    rewards.speed_reward_curriculum(env, None, **params)
+    assert terms["speed_forward"].weight == 12.0
+    assert terms["action_rate_l2"].weight == pytest.approx(-0.3)
+
+
 def test_drive_stage_preserves_81d_source_safety_and_ramps_motion_freedom():
     cfg = make_env_cfg(stage="baseline")
     original = deepcopy(cfg)
