@@ -11,7 +11,7 @@ seed           = 2
 
 [params.forward_reward]
 label = "Follow the speed order"
-value = 2.0
+value = 4.92717633928571
 min   = 0.5
 max   = 5.0
 
@@ -23,7 +23,7 @@ max   = 5.0
 
 [params.step_reward]
 label = "Lift your feet"
-value = 3.0
+value = 6.0
 min   = 0.0
 max   = 6.0
 
