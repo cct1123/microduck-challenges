@@ -12,19 +12,21 @@ from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 import microduck_challenges  # noqa: F401 (register tasks before upstream imports)
 from microduck_challenges.sprint_2m import env as sprint_env
 from microduck_challenges.sprint_2m import rewards
+from mjlab_microduck import challenge
 from mjlab_microduck.tasks import mdp as microduck_mdp
 
 
 def test_baseline_uses_dense_reference_rewards_without_changing_arena_commands():
     cfg = sprint_env.make_env_cfg(stage="baseline")
+    knobs = challenge.params(sprint_env.__file__)
     speed = cfg.rewards["track_linear_velocity"]
     assert speed.func is mdp.track_linear_velocity
-    assert speed.weight == 2.0
+    assert speed.weight == knobs["forward_reward"]
     assert speed.params["std"] == pytest.approx(math.sqrt(0.1))
     assert cfg.rewards["upright"].func is mdp.upright
-    assert cfg.rewards["upright"].weight == 2.0
+    assert cfg.rewards["upright"].weight == knobs["upright_reward"]
     assert cfg.rewards["air_time"].func is mdp.feet_air_time
-    assert cfg.rewards["air_time"].weight == 3.0
+    assert cfg.rewards["air_time"].weight == knobs["step_reward"]
     assert cfg.rewards["air_time"].params["threshold_min"] == 0.125
     assert cfg.rewards["air_time"].params["threshold_max"] == 0.3
     assert cfg.rewards["heading_hold"].func is microduck_mdp.heading_hold_reward

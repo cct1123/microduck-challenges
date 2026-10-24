@@ -4,9 +4,9 @@ event = "sprint-2m"
 task  = "Mjlab-Sprint2m-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # electricshaka reference strategy; existing local budget
+[recipe]                  # next forward-drive fine-tune; does not alter the live run
 num_envs       = 2048
-max_iterations = 3000
+max_iterations = 600
 seed           = 2
 
 [params.forward_reward]
@@ -27,12 +27,25 @@ value = 6.0
 min   = 0.0
 max   = 6.0
 
-# Keep the baseline until competent. For a separately launched fine-tune, set
-# stage = "speed" or prefix train with MICRODUCK_SPRINT_STAGE=speed.
-# The speed stage selects the fastest compatible saved 5/5 baseline result;
-# it refuses to train from scratch or silently choose the latest checkpoint.
+# The NEXT Workshop/CLI launch is a genuine 81D-baseline warm start.
+# Refresh the Workshop recipe and use 600 NEW iterations (not a stale 3000).
+# Both fine-tune stages refuse a cold start and choose by saved 5/5 race time.
 [training]
-stage = "baseline"
+stage = "drive"
+
+[training.drive]
+# Re-select the best compatible 5/5 result when the next process starts.
+# Keep this run's 81D critic; do not substitute the older 77D source profile.
+source_run = "2026-10-23_21-14-10_run-1023-2113"
+max_iterations = 600
+save_interval = 25
+learning_rate = 0.0001
+hold_iterations = 50
+ramp_iterations = 350
+forward_reward = 5.0     # signed spawn-course tanh speed: 0 -> 5
+vel_ref = 1.5            # reward scale, not a speed command/cap
+forward_variance = 0.30  # forward-pitch sin^2 tolerance: 0.05 -> 0.30
+motion_speed = 0.5       # full lean relaxation above this forward speed (m/s)
 
 [training.speed]
 # Provenance: 6ac3c45; fastest saved 5/5 is model_750.pt, 2.588 s at 0.90 m/s.

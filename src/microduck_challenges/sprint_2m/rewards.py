@@ -1,6 +1,8 @@
-"""Reference locomotion, opt-in speed fine-tuning and Sprint checkpoint selection.
+"""Reference locomotion, warm-started fine-tuning and Sprint checkpoint selection.
 
-The baseline stays the default; the speed stage requires a compatible 5/5 policy.
+The TOML defaults to drive; both fine-tune stages require a compatible 5/5 policy.
+Reward weights ramp on environment resets; forward-lean tolerance ramps each
+step, so their transitions need not be simultaneous at the nominal boundaries.
 The former race functions remain importable for saved experiment configurations;
 their clock, mastery gate and terminal costs are not active in the new recipe.
 """
@@ -195,6 +197,57 @@ def forward_progress(
     return torch.where(valid, reward, 0.0)
 
 
+def _course_velocity(env, asset_cfg):
+    """Match heading_hold's first-step reference without depending on reward order."""
+    data = env.scene[asset_cfg.name].data
+    w, x, y, z = data.root_link_quat_w.unbind(-1)
+    yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    reference = torch.where(
+        env.episode_length_buf <= 1, yaw, getattr(env, "_heading_ref", yaw),
+    )
+    velocity = data.root_link_lin_vel_w
+    speed = reference.cos() * velocity[:, 0] + reference.sin() * velocity[:, 1]
+    valid = (torch.isfinite(velocity).all(-1)
+             & torch.isfinite(data.root_link_quat_w).all(-1)
+             & torch.isfinite(data.projected_gravity_b).all(-1)
+             & torch.isfinite(reference)
+             & (data.projected_gravity_b[:, 2] < FALL_GRAVITY_Z))
+    return torch.where(valid, speed, 0.0), valid
+
+
+def course_forward_speed(env, vel_ref=1.5, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG):
+    """Bounded signed spawn-course speed; no command target or payout while fallen."""
+    if not math.isfinite(vel_ref) or vel_ref <= 0:
+        raise ValueError("vel_ref must be finite and positive")
+    speed, _ = _course_velocity(env, asset_cfg)
+    return torch.tanh(speed / vel_ref)
+
+
+def drive_upright(env, std, forward_variance, hold_steps, ramp_steps, motion_speed,
+                  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG):
+    """Permit nose-down pitch during forward travel, not roll/backward lean or camping.
+
+    On the flat Sprint course projected gravity x is positive for nose-down
+    pitch. Keep the original upright optimum; only widen its forward tolerance
+    as the stage advances AND course speed rises from zero to motion_speed.
+    """
+    for name, value in (("std", std), ("forward_variance", forward_variance),
+                        ("ramp_steps", ramp_steps), ("motion_speed", motion_speed)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if not math.isfinite(hold_steps) or hold_steps < 0 or forward_variance < std**2:
+        raise ValueError("hold_steps must be nonnegative and forward variance cannot tighten upright")
+    speed, valid = _course_velocity(env, asset_cfg)
+    gravity = env.scene[asset_cfg.name].data.projected_gravity_b
+    fraction = min(1.0, max(0.0, (env.common_step_counter - hold_steps) / ramp_steps))
+    blend = fraction * (speed / motion_speed).clamp(0.0, 1.0)
+    variance = std**2 + blend * (forward_variance - std**2)
+    pitch_variance = torch.where(gravity[:, 0] > 0, variance, std**2)
+    value = torch.exp(-gravity[:, 0].square() / pitch_variance
+                      -gravity[:, 1].square() / std**2)
+    return torch.where(valid, value, 0.0)
+
+
 def productive_air_time(
     env,
     sensor_name: str,
@@ -364,10 +417,42 @@ def select_sprint_checkpoint(log_root, *, run_pattern=".*", stage="any",
     return min(eligible, key=lambda item: (item["score"], item["checkpoint"], str(item["path"])))
 
 
-class SprintSpeedPPO(PPO):
+def mark_actor_only_inference(env, env_ids=None):
+    """Explicit play/export marker; never infer mode from tensor dimensions."""
+    del env_ids
+    env._sprint_inference_only = True
+
+
+class SprintPPO(PPO):
+    """Load only the actor for explicit play/export; keep training loads strict."""
+
+    @staticmethod
+    def construct_algorithm(obs, env, cfg, device):
+        algorithm = PPO.construct_algorithm(obs, env, cfg, device)
+        setattr(
+            algorithm, "_sprint_inference_only",
+            bool(getattr(getattr(env, "unwrapped", env), "_sprint_inference_only", False)),
+        )
+        return algorithm
+
+    def load(self, loaded_dict, load_cfg=None, strict=True):
+        if getattr(self, "_sprint_inference_only", False):
+            load_cfg = {"actor": True, "critic": False, "optimizer": False,
+                        "iteration": False, "rnd": False}
+        return super().load(loaded_dict, load_cfg, strict)
+
+    def train_mode(self):
+        if getattr(self, "_sprint_inference_only", False):
+            raise RuntimeError("The actor-only Sprint play/export model is inference-only.")
+        super().train_mode()
+
+
+class SprintSpeedPPO(SprintPPO):
     """Warm-start weights/normalizers, not the old optimizer or iteration clock."""
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
+        if getattr(self, "_sprint_inference_only", False):
+            return super().load(loaded_dict, load_cfg, strict)
         if load_cfg is None:
             load_cfg = {"actor": True, "critic": True, "optimizer": False,
                         "iteration": False, "rnd": False}
@@ -382,6 +467,8 @@ class SprintSpeedPPO(PPO):
         return restored_iteration
 
     def train_mode(self):
+        if getattr(self, "_sprint_inference_only", False):
+            raise RuntimeError("The actor-only Sprint play/export model is inference-only.")
         if not getattr(self, "_sprint_warm_started", False):
             raise RuntimeError("The Sprint speed stage requires a loaded locomotion checkpoint.")
         super().train_mode()
@@ -444,6 +531,38 @@ def configure_speed_locomotion(cfg, settings, selected, rollout_steps=24):
     for curriculum in cfg.curriculum.values():
         for entry in curriculum.params.get("range_stages", []):
             entry["step"] = max(-1, entry["step"] - source_steps)
+    return cfg
+
+
+def configure_drive_locomotion(cfg, settings, selected, rollout_steps=24):
+    """Specialize the current 81D baseline: course drive, mobile head and forward lean."""
+    source = selected["source_env"]
+    current_rewards = _config_data(cfg)["rewards"]
+    if current_rewards.keys() != source["rewards"].keys():
+        raise ValueError("Incompatible source reward set for drive stage")
+    source_steps = (selected["checkpoint"] + 1) * selected["source_agent"]["num_steps_per_env"]
+    for name, term in current_rewards.items():
+        saved = source["rewards"][name]
+        if term["func"] != saved["func"] or term["params"] != saved["params"]:
+            raise ValueError(f"Incompatible source reward semantics: {name}")
+        weight = saved["weight"]
+        for curriculum in source["curriculum"].values():
+            params = curriculum["params"]
+            if params.get("reward_name") == name:
+                for entry in params.get("weight_stages", []):
+                    if source_steps > entry["step"]:
+                        weight = entry["weight"]
+        cfg.rewards[name].weight = weight
+    cfg = configure_speed_locomotion(cfg, settings, selected, rollout_steps)
+    params = cfg.curriculum["speed_rewards"].params
+    initial = cfg.rewards["head_pose_tracking"].weight
+    params["targets"]["head_pose_tracking"] = (initial, 0.25 * initial)
+    cfg.rewards["speed_forward"].func = course_forward_speed
+    cfg.rewards["upright"].func = drive_upright
+    cfg.rewards["upright"].params.update(
+        forward_variance=settings["forward_variance"], motion_speed=settings["motion_speed"],
+        hold_steps=params["hold_steps"], ramp_steps=params["ramp_steps"],
+    )
     return cfg
 
 
