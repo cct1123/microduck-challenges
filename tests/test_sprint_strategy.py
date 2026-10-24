@@ -13,6 +13,7 @@ from rsl_rl.modules.distribution import GaussianDistribution
 from microduck_challenges.sprint_2m import env as sprint_env
 from microduck_challenges.sprint_2m import rewards
 from microduck_challenges.sprint_2m import promotion
+from microduck_challenges.sprint_2m import campaign
 
 
 def test_default_exploration_is_a_bounded_free_leg_screen():
@@ -134,10 +135,37 @@ def test_promotion_cannot_bind_another_checkpoint_to_passing_seed_rows(tmp_path,
         promotion.require_promotion(evidence, wrong, report["gate"])
 
 
+def test_launch_plan_is_bounded_explicit_and_does_not_launch():
+    make_plan = cast(Any, getattr(campaign, "make_plan", None))
+    assert callable(make_plan), "the strategy needs a bounded launcher"
+    plan = cast(dict[str, Any], make_plan("explore"))
+    assert plan["max_iterations"] == 500
+    assert plan["environment"]["MICRODUCK_SPRINT_PHASE"] == "explore"
+    assert plan["source"].endswith("model_8250.pt")
+    assert "--gpu-ids" in plan["command"] and "all" in plan["command"]
+    command = cast(list[str], plan["command"])
+    assert command[command.index("--agent.upload-model") + 1] == "False"
+    with pytest.raises(ValueError, match="budget"):
+        make_plan("explore", iterations=501)
 
 
+def test_actor_export_uses_actual_checkpoint_and_preserves_source(tmp_path):
+    export_actor = cast(Any, getattr(campaign, "export_actor", None))
+    assert callable(export_actor), "assessment needs an isolated verified actor export"
+    source = sprint_env.REFINE_CHECKPOINT["path"]
+    before = promotion.digest(source)
+    output = tmp_path / "policy.onnx"
+    metadata = cast(dict[str, Any], export_actor(source, output))
+    assert output.is_file() and metadata["parity_cases"] >= 3
+    assert metadata["input_shape"] == [1, 61] and metadata["output_shape"] == [1, 14]
+    assert promotion.digest(source) == before
 
 
+def test_bounded_launcher_refuses_a_second_trainer_before_preflight(tmp_path, monkeypatch):
+    monkeypatch.setattr(campaign, "active_trainers", lambda: [12345], raising=False)
+    monkeypatch.setattr(campaign.subprocess, "run", lambda *a, **k: pytest.fail("preflight must not start"))
+    with pytest.raises(ValueError, match="trainer"):
+        campaign.run_bounded({"requires_promotion": False, "max_wall_minutes": 40}, tmp_path / "run")
 
 
 @pytest.fixture
@@ -207,3 +235,34 @@ def test_refinement_rejects_inconsistent_saved_noise_phase(tmp_path):
     with pytest.raises(ValueError, match="noise"):
         rewards.configure_refine_locomotion(sprint_env.make_env_cfg(stage="baseline"),
                                             sprint_env.REFINE_SETTINGS, selected)
+
+
+@pytest.mark.parametrize("outcome,expected", [(0, "completed"), (7, "failed"), ("timeout", "wall_budget_exhausted")])
+def test_bounded_process_lifecycle_is_journaled(tmp_path, monkeypatch, outcome, expected):
+    """Only the subprocess boundary is faked; this is not a GPU training result."""
+    plan = campaign.make_plan("explore")
+    monkeypatch.setattr(campaign, "LOG_ROOT", tmp_path / "logs/rsl_rl/sprint_2m")
+    monkeypatch.setattr(campaign, "active_trainers", lambda: [])
+    monkeypatch.setattr(campaign, "smoke", lambda *a: None)
+    monkeypatch.setattr(campaign.subprocess, "run", lambda *a, **k: None)
+    signals = []
+    class Process:
+        pid = 12345
+        returncode = None
+        calls = 0
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            self.calls += 1
+            self.returncode = -15 if outcome == "timeout" else outcome
+            return self.returncode
+    if outcome == "timeout":
+        clock = iter((0.0, 3000.0))
+        monkeypatch.setattr(campaign, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(campaign.subprocess, "Popen", lambda *a, **k: Process())
+    monkeypatch.setattr(campaign.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    output = tmp_path / "run"
+    result = campaign.run_bounded(plan, output)
+    assert result["state"] == expected
+    assert json.loads((output / "run.json").read_text())["state"] == expected
+    assert bool(signals) == (outcome == "timeout")
