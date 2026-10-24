@@ -1,8 +1,8 @@
 """Reference locomotion, warm-started fine-tuning and Sprint checkpoint selection.
 
-The TOML defaults to drive; both fine-tune stages require a compatible 5/5 policy.
-Reward weights ramp on environment resets; forward-lean tolerance ramps each
-step, so their transitions need not be simultaneous at the nominal boundaries.
+The TOML defaults to refinement of a compatible, fully-ramped 5/5 drive policy.
+Refinement preserves the source environment age and mature reward weights;
+the older speed/drive stages restart their reward ramps on a new stage clock.
 The former race functions remain importable for saved experiment configurations;
 their clock, mastery gate and terminal costs are not active in the new recipe.
 """
@@ -13,6 +13,7 @@ import inspect
 import json
 import math
 import re
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
@@ -197,8 +198,10 @@ def forward_progress(
     return torch.where(valid, reward, 0.0)
 
 
-def _course_velocity(env, asset_cfg):
+def _course_velocity(env, asset_cfg, max_tilt_deg=60.0):
     """Match heading_hold's first-step reference without depending on reward order."""
+    if not math.isfinite(max_tilt_deg) or not 60.0 <= max_tilt_deg <= 70.0:
+        raise ValueError("max_tilt_deg must be finite and between 60 and 70 degrees")
     data = env.scene[asset_cfg.name].data
     w, x, y, z = data.root_link_quat_w.unbind(-1)
     yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
@@ -207,24 +210,31 @@ def _course_velocity(env, asset_cfg):
     )
     velocity = data.root_link_lin_vel_w
     speed = reference.cos() * velocity[:, 0] + reference.sin() * velocity[:, 1]
+    guard = getattr(env, "_sprint_tilt_guard", None)
+    # Deep lean needs a live held-fall guard; legacy and unguarded calls keep 60 degrees.
+    cutoff = (FALL_GRAVITY_Z if guard is None or max_tilt_deg == 60.0
+              else -math.cos(math.radians(max_tilt_deg)))
     valid = (torch.isfinite(velocity).all(-1)
              & torch.isfinite(data.root_link_quat_w).all(-1)
              & torch.isfinite(data.projected_gravity_b).all(-1)
              & torch.isfinite(reference)
-             & (data.projected_gravity_b[:, 2] < FALL_GRAVITY_Z))
+             & (data.projected_gravity_b[:, 2] < cutoff))
+    if guard is not None:
+        valid &= ~guard.failed
     return torch.where(valid, speed, 0.0), valid
 
 
-def course_forward_speed(env, vel_ref=1.5, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG):
+def course_forward_speed(env, vel_ref=1.5, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+                         max_tilt_deg=60.0):
     """Bounded signed spawn-course speed; no command target or payout while fallen."""
     if not math.isfinite(vel_ref) or vel_ref <= 0:
         raise ValueError("vel_ref must be finite and positive")
-    speed, _ = _course_velocity(env, asset_cfg)
+    speed, _ = _course_velocity(env, asset_cfg, max_tilt_deg)
     return torch.tanh(speed / vel_ref)
 
 
 def drive_upright(env, std, forward_variance, hold_steps, ramp_steps, motion_speed,
-                  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG):
+                  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, max_tilt_deg=60.0):
     """Permit nose-down pitch during forward travel, not roll/backward lean or camping.
 
     On the flat Sprint course projected gravity x is positive for nose-down
@@ -237,7 +247,7 @@ def drive_upright(env, std, forward_variance, hold_steps, ramp_steps, motion_spe
             raise ValueError(f"{name} must be finite and positive")
     if not math.isfinite(hold_steps) or hold_steps < 0 or forward_variance < std**2:
         raise ValueError("hold_steps must be nonnegative and forward variance cannot tighten upright")
-    speed, valid = _course_velocity(env, asset_cfg)
+    speed, valid = _course_velocity(env, asset_cfg, max_tilt_deg)
     gravity = env.scene[asset_cfg.name].data.projected_gravity_b
     fraction = min(1.0, max(0.0, (env.common_step_counter - hold_steps) / ramp_steps))
     blend = fraction * (speed / motion_speed).clamp(0.0, 1.0)
@@ -246,6 +256,33 @@ def drive_upright(env, std, forward_variance, hold_steps, ramp_steps, motion_spe
     value = torch.exp(-gravity[:, 0].square() / pitch_variance
                       -gravity[:, 1].square() / std**2)
     return torch.where(valid, value, 0.0)
+
+
+class ArenaTiltGuard:
+    """End sustained >60-degree tilts after 0.3 s; allow brief recovery excursions.
+
+    Terminations run before rewards, so the shared per-world failed mask stops
+    deep-lean rewards on the held-fall step, before auto-reset.
+    """
+
+    def __init__(self, cfg, env):
+        del cfg
+        self.hold_steps = max(1, round(FALL_HOLD_S / env.step_dt))
+        self.steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self.failed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._sprint_tilt_guard = self
+
+    def __call__(self, env):
+        gravity_z = env.scene["robot"].data.projected_gravity_b[:, 2]
+        tipped = gravity_z > FALL_GRAVITY_Z
+        self.steps[:] = torch.where(tipped, (self.steps + 1).clamp_max(self.hold_steps), 0)
+        self.failed[:] = (self.steps >= self.hold_steps) | ~torch.isfinite(gravity_z)
+        return self.failed
+
+    def reset(self, env_ids=None):
+        rows = slice(None) if env_ids is None else env_ids
+        self.steps[rows] = 0
+        self.failed[rows] = False
 
 
 def productive_air_time(
@@ -314,7 +351,7 @@ def _config_data(config):
     return yaml.load(yaml.dump(asdict(config), sort_keys=False), Loader=_ConfigLoader)
 
 
-def select_sprint_checkpoint(log_root, *, run_pattern=".*", stage="any",
+def select_sprint_checkpoint(log_root, *, run_pattern=".*", stage="any", checkpoint=None,
                              expected_env=None, expected_agent=None):
     """Choose the fastest verified 5/5 saved result, never the latest checkpoint.
 
@@ -325,6 +362,8 @@ def select_sprint_checkpoint(log_root, *, run_pattern=".*", stage="any",
     """
     if stage not in ("any", "baseline", "speed"):
         raise ValueError(f"Unknown source stage: {stage!r}")
+    if checkpoint is not None and (type(checkpoint) is not int or checkpoint < 0):
+        raise ValueError("checkpoint must be a nonnegative integer")
     pattern = re.compile(run_pattern)
     root = Path(log_root).resolve()
     wanted_env = _config_data(expected_env) if expected_env is not None else None
@@ -382,6 +421,8 @@ def select_sprint_checkpoint(log_root, *, run_pattern=".*", stage="any",
                 number = result["checkpoint"]
                 if type(number) is not int or number < 0 or result_file.stem != f"model_{number}":
                     raise ValueError("invalid checkpoint identifier")
+                if checkpoint is not None and number != checkpoint:
+                    continue
                 artifact = run / f"model_{number}.pt"
                 if not artifact.is_file() or artifact.stat().st_size == 0:
                     raise ValueError("missing/empty training checkpoint")
@@ -474,10 +515,29 @@ class SprintSpeedPPO(SprintPPO):
         super().train_mode()
 
 
-def speed_reward_curriculum(env, env_ids, targets, hold_steps, ramp_steps):
+class SprintRefinePPO(SprintSpeedPPO):
+    """Fresh optimizer/runner iteration while preserving the source environment age."""
+
+    def load(self, loaded_dict, load_cfg=None, strict=True):
+        if getattr(self, "_sprint_inference_only", False):
+            return super().load(loaded_dict, load_cfg, strict)
+        required = {"actor": True, "critic": True, "optimizer": False,
+                    "iteration": False, "rnd": False}
+        if not strict or (load_cfg is not None and load_cfg != required):
+            raise ValueError("Refine requires a strict full actor/critic warm start")
+        clock = (loaded_dict.get("infos") or {}).get("env_state", {}).get("common_step_counter")
+        if type(clock) is not int or clock <= 0:
+            raise ValueError("Refine requires the saved source environment clock")
+        # An explicit load config bypasses SprintSpeedPPO's new-stage clock reset.
+        return super().load(loaded_dict, required, strict=True)
+
+
+def speed_reward_curriculum(env, env_ids, targets, hold_steps, ramp_steps, initial_fraction=0.0):
     """Blend live reward weights on the new stage's clock, on curriculum resets."""
     del env_ids
-    fraction = min(1.0, max(0.0, (env.common_step_counter - hold_steps) / ramp_steps))
+    if not math.isfinite(initial_fraction) or not 0.0 <= initial_fraction <= 1.0:
+        raise ValueError("initial_fraction must be between zero and one")
+    fraction = min(1.0, max(initial_fraction, (env.common_step_counter - hold_steps) / ramp_steps))
     for name, (initial, final) in targets.items():
         env.reward_manager.get_term_cfg(name).weight = initial + fraction * (final - initial)
     return torch.tensor(fraction, device=env.device)
@@ -531,6 +591,51 @@ def configure_speed_locomotion(cfg, settings, selected, rollout_steps=24):
     for curriculum in cfg.curriculum.values():
         for entry in curriculum.params.get("range_stages", []):
             entry["step"] = max(-1, entry["step"] - source_steps)
+    return cfg
+
+
+def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
+    """Continue a fully-ramped drive recipe using known callables, never YAML objects."""
+    # Construction metadata only: this does not select or invent policy evidence.
+    baseline = {"source_env": _config_data(cfg),
+                "source_agent": {"num_steps_per_env": rollout_steps},
+                "checkpoint": settings["source_baseline_checkpoint"]}
+    cfg = configure_drive_locomotion(cfg, settings, baseline, rollout_steps)
+    canonical = _config_data(cfg)
+    source = selected["source_env"]
+    source_steps = (selected["checkpoint"] + 1) * selected["source_agent"]["num_steps_per_env"]
+    if source["rewards"].keys() != canonical["rewards"].keys():
+        raise ValueError("Incompatible source reward set for refine stage")
+    for name, term in canonical["rewards"].items():
+        saved = source["rewards"][name]
+        if saved["func"] != term["func"] or saved["params"] != term["params"]:
+            raise ValueError(f"Incompatible source reward semantics: {name}")
+        weight = saved["weight"]
+        if type(weight) not in (int, float) or not math.isfinite(weight):
+            raise ValueError(f"Invalid source reward weight: {name}")
+        cfg.rewards[name].weight = weight
+    if source["curriculum"] != canonical["curriculum"]:
+        raise ValueError("Incompatible source curriculum for refine stage")
+    # Keep canonical functions and resolved entity configs; copy primitive params only.
+    for name, term in source["curriculum"].items():
+        cfg.curriculum[name].params = deepcopy(term["params"])
+    params = cfg.curriculum["speed_rewards"].params
+    if source_steps < params["hold_steps"] + params["ramp_steps"]:
+        raise ValueError("Refine requires a fully-ramped source checkpoint")
+    # Environment construction resets before runner.load restores the source
+    # clock. Keep both weights and the logged phase mature during that reset.
+    params["initial_fraction"] = 1.0
+    for name, (initial, final) in params["targets"].items():
+        cfg.rewards[name].weight = initial + (final - initial)
+    # Validate the source's original recipe before applying this deliberate change.
+    lean_variance = settings["lean_forward_variance"]
+    max_tilt = settings["lean_max_tilt_deg"]
+    if (not math.isfinite(lean_variance) or lean_variance < settings["forward_variance"]
+            or not math.isfinite(max_tilt) or not 60.0 <= max_tilt <= 70.0):
+        raise ValueError("Invalid refinement forward-lean settings")
+    cfg.rewards["upright"].params.update(forward_variance=lean_variance, max_tilt_deg=max_tilt)
+    cfg.rewards["speed_forward"].params["max_tilt_deg"] = max_tilt
+    cfg.terminations["arena_tilt_hold"] = TerminationTermCfg(func=ArenaTiltGuard, time_out=False)
     return cfg
 
 

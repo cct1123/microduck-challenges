@@ -16,6 +16,63 @@ from microduck_challenges.sprint_2m import rewards
 from microduck_challenges.sprint_2m.env import RL_CFG, SPEED_SETTINGS, make_env_cfg
 
 
+def test_default_refine_selects_latest_winner_not_original_baseline():
+    from microduck_challenges.sprint_2m import env as sprint_env
+
+    assert sprint_env.STAGE_SETTINGS["stage"] == "refine"
+    if sprint_env.TRAINING_STAGE != "refine":
+        pytest.skip("explicit archived-stage test process")
+    selected = sprint_env.REFINE_CHECKPOINT
+    assert selected["path"].parent.name == "2026-10-23_23-38-30_run-1023-2338"
+    assert selected["checkpoint"] == 1025 and selected["stage"] == "speed"
+    assert RL_CFG.resume and RL_CFG.max_iterations == 10000
+    assert RL_CFG.seed == 2 and RL_CFG.save_interval == 250
+    assert RL_CFG.algorithm.learning_rate == 5e-5
+    assert RL_CFG.algorithm.schedule == "fixed"
+    assert RL_CFG.algorithm.class_name.endswith(":SprintRefinePPO")
+    assert sprint_env.TRAINING_RECIPE["num_envs"] == 2048
+    cfg = make_env_cfg()
+    assert cfg.rewards["speed_forward"].weight == 12.0
+    assert cfg.rewards["head_pose_tracking"].weight == 0.5
+    assert cfg.rewards["head_pose_bias"].weight == 1.0
+    assert cfg.rewards["pose"].weight == 0.6
+    assert cfg.rewards["action_rate_l2"].weight == pytest.approx(-0.3)
+    assert cfg.rewards["upright"].params["forward_variance"] == 0.8
+    assert cfg.rewards["upright"].params["max_tilt_deg"] == 70.0
+    assert cfg.rewards["speed_forward"].params["max_tilt_deg"] == 70.0
+    assert cfg.terminations["arena_tilt_hold"].func is rewards.ArenaTiltGuard
+
+
+def test_refine_starts_mature_before_the_runner_restores_the_source_clock():
+    from microduck_challenges.sprint_2m import env as sprint_env
+
+    if sprint_env.TRAINING_STAGE != "refine":
+        pytest.skip("explicit archived-stage test process")
+    cfg = make_env_cfg()
+    params = cfg.curriculum["speed_rewards"].params
+    terms = {name: SimpleNamespace(weight=cfg.rewards[name].weight) for name in params["targets"]}
+    env = SimpleNamespace(common_step_counter=0, device="cpu",
+                          reward_manager=SimpleNamespace(get_term_cfg=terms.__getitem__))
+    assert rewards.speed_reward_curriculum(env, None, **params).item() == 1.0
+    assert terms["speed_forward"].weight == 12.0
+    assert terms["action_rate_l2"].weight == pytest.approx(-0.3)
+
+
+def test_explicit_checkpoint_filter_never_substitutes_faster_or_invalid_result(tmp_path, source_cfg):
+    run = _run(tmp_path, "source", source_cfg)
+    _result(run, 1025, [1.680] * 5)
+    _result(run, 1199, [1.664] * 5)
+    best = rewards.select_sprint_checkpoint(
+        tmp_path, checkpoint=1025, expected_env=source_cfg, expected_agent=RL_CFG,
+    )
+    assert best["checkpoint"] == 1025
+    _result(run, 1025, [1.680] * 5, seeds_finished=4)
+    with pytest.raises(RuntimeError, match="Refusing a cold start"):
+        rewards.select_sprint_checkpoint(tmp_path, checkpoint=1025)
+    with pytest.raises(ValueError, match="checkpoint"):
+        rewards.select_sprint_checkpoint(tmp_path, checkpoint="1025")
+
+
 @pytest.fixture
 def source_cfg():
     return make_env_cfg(stage="source")
@@ -183,14 +240,36 @@ def test_warm_start_keeps_weights_and_normalizers_but_not_optimizer_or_clocks():
     assert actor.training and critic.training
 
 
-def test_speed_algorithm_refuses_random_policy_training():
-    algorithm = object.__new__(rewards.SprintSpeedPPO)
+def test_refine_warm_start_preserves_source_clock_but_resets_optimizer_iteration():
+    algorithm_class = getattr(rewards, "SprintRefinePPO", rewards.SprintSpeedPPO)
+    algorithm = cast(Any, object.__new__(algorithm_class))
+    algorithm.actor, algorithm.critic = torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)
+    algorithm.rnd = None
+    algorithm.optimizer = torch.optim.Adam(
+        [*algorithm.actor.parameters(), *algorithm.critic.parameters()], lr=5e-5,
+    )
+    payload = {"actor_state_dict": deepcopy(algorithm.actor.state_dict()),
+               "critic_state_dict": deepcopy(algorithm.critic.state_dict()),
+               "optimizer_state_dict": {"must_not_be_loaded": True}, "iter": 1025,
+               "infos": {"env_state": {"common_step_counter": 24624}}}
+    original = deepcopy(payload)
+    assert algorithm.load(payload) is False
+    assert payload["infos"] == original["infos"]
+    assert algorithm.optimizer.param_groups[0]["lr"] == 5e-5
+    assert not algorithm.optimizer.state
+    algorithm.train_mode()
+
+
+@pytest.mark.parametrize("algorithm_class", [rewards.SprintSpeedPPO, rewards.SprintRefinePPO])
+def test_speed_algorithm_refuses_random_policy_training(algorithm_class):
+    algorithm = object.__new__(algorithm_class)
     with pytest.raises(RuntimeError, match="requires a loaded locomotion checkpoint"):
         algorithm.train_mode()
 
 
-def test_inference_restores_actor_without_loading_incompatible_critic():
-    algorithm = cast(Any, object.__new__(rewards.SprintSpeedPPO))
+@pytest.mark.parametrize("algorithm_class", [rewards.SprintSpeedPPO, rewards.SprintRefinePPO])
+def test_inference_restores_actor_without_loading_incompatible_critic(algorithm_class):
+    algorithm = cast(Any, object.__new__(algorithm_class))
     algorithm.actor = torch.nn.Linear(2, 1)
     algorithm.critic = torch.nn.Linear(3, 1)
     algorithm.rnd = None
@@ -209,14 +288,15 @@ def test_inference_restores_actor_without_loading_incompatible_critic():
         algorithm.train_mode()
 
 
-def test_training_still_rejects_incompatible_critic():
-    algorithm = cast(Any, object.__new__(rewards.SprintSpeedPPO))
+@pytest.mark.parametrize("algorithm_class", [rewards.SprintSpeedPPO, rewards.SprintRefinePPO])
+def test_training_still_rejects_incompatible_critic(algorithm_class):
+    algorithm = cast(Any, object.__new__(algorithm_class))
     algorithm.actor = torch.nn.Linear(2, 1)
     algorithm.critic = torch.nn.Linear(3, 1)
     algorithm.rnd = None
     checkpoint = {"actor_state_dict": algorithm.actor.state_dict(),
                   "critic_state_dict": torch.nn.Linear(4, 1).state_dict(),
-                  "infos": {}, "iter": 750}
+                  "infos": {"env_state": {"common_step_counter": 24624}}, "iter": 750}
     with pytest.raises(RuntimeError, match="size mismatch"):
         algorithm.load(checkpoint)
 
@@ -229,6 +309,28 @@ def test_only_play_configs_mark_actor_only_inference(source_cfg):
     probe = SimpleNamespace()
     marker.func(probe)
     assert probe._sprint_inference_only is True
+
+
+@pytest.mark.parametrize("options", [{"strict": False}, {"load_cfg": {"actor": True}}])
+def test_refine_refuses_non_strict_or_partial_training_restore(options):
+    algorithm = cast(Any, object.__new__(rewards.SprintRefinePPO))
+    algorithm.actor, algorithm.critic = torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)
+    algorithm.rnd = None
+    payload = {"actor_state_dict": algorithm.actor.state_dict(),
+               "critic_state_dict": algorithm.critic.state_dict(),
+               "infos": {"env_state": {"common_step_counter": 24624}}}
+    with pytest.raises(ValueError, match="strict full"):
+        algorithm.load(payload, **options)
+
+
+def test_refine_requires_saved_environment_clock():
+    algorithm = cast(Any, object.__new__(rewards.SprintRefinePPO))
+    algorithm.actor, algorithm.critic = torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)
+    algorithm.rnd = None
+    payload = {"actor_state_dict": algorithm.actor.state_dict(),
+               "critic_state_dict": algorithm.critic.state_dict(), "infos": {}}
+    with pytest.raises(ValueError, match="source environment clock"):
+        algorithm.load(payload)
 
 
 def _drive_env(yaw=0.0, pitch=0.0, roll=0.0, speed=1.0):
@@ -246,6 +348,65 @@ def _drive_env(yaw=0.0, pitch=0.0, roll=0.0, speed=1.0):
     return SimpleNamespace(scene={"robot": SimpleNamespace(data=data)},
                            episode_length_buf=torch.tensor([10]),
                            _heading_ref=torch.tensor([yaw]), common_step_counter=9600)
+
+
+def _guarded_lean_env(pitch=65.0, roll=0.0, speed=1.0):
+    env = _drive_env(pitch=math.radians(pitch), roll=math.radians(roll), speed=speed)
+    env.num_envs, env.device, env.step_dt = 1, "cpu", 0.02
+    guard = rewards.ArenaTiltGuard(None, env)
+    return env, guard
+
+
+def test_transient_forward_lean_above_60_is_allowed_but_held_fall_is_not_rewarded():
+    env, guard = _guarded_lean_env()
+    params = dict(std=math.sqrt(0.05), forward_variance=0.8, hold_steps=1200,
+                  ramp_steps=4800, motion_speed=0.5, max_tilt_deg=70.0)
+    for _ in range(14):
+        assert not guard(env).item()
+        assert rewards.course_forward_speed(env, max_tilt_deg=70.0).item() > 0
+        assert rewards.drive_upright(env, **params).item() > 0.3
+    assert guard(env).item()
+    assert rewards.course_forward_speed(env, max_tilt_deg=70.0).item() == 0
+    assert rewards.drive_upright(env, **params).item() == 0
+
+
+def test_tilt_guard_recovery_and_partial_reset_are_independent():
+    env, _ = _guarded_lean_env()
+    env.num_envs = 2
+    gravity = env.scene["robot"].data.projected_gravity_b.repeat(2, 1)
+    env.scene["robot"].data.projected_gravity_b = gravity
+    guard = rewards.ArenaTiltGuard(None, env)
+    for _ in range(14):
+        assert not guard(env).any()
+    gravity[0, 2] = -1.0
+    assert guard(env).tolist() == [False, True]
+    assert guard.steps.tolist() == [0, 15]
+    guard.reset(env_ids=torch.tensor([0]))
+    assert guard.failed.tolist() == [False, True]
+    guard.reset()
+    assert not guard.steps.any() and not guard.failed.any()
+
+
+def test_deep_lean_requires_guard_and_preserves_stationary_roll_backward_guidance():
+    params = dict(std=math.sqrt(0.05), forward_variance=0.8, hold_steps=1200,
+                  ramp_steps=4800, motion_speed=0.5, max_tilt_deg=70.0)
+    unguarded = _drive_env(pitch=math.radians(65))
+    assert rewards.course_forward_speed(unguarded, max_tilt_deg=70.0).item() == 0
+    assert rewards.drive_upright(unguarded, **params).item() == 0
+    for pitch, roll, speed in [(65, 0, 0), (-65, 0, 1), (0, 65, 1)]:
+        env, guard = _guarded_lean_env(pitch=pitch, roll=roll, speed=speed)
+        guard(env)
+        assert rewards.drive_upright(env, **params).item() < 0.001
+    env, guard = _guarded_lean_env(pitch=75)
+    guard(env)
+    assert rewards.course_forward_speed(env, max_tilt_deg=70.0).item() == 0
+    assert rewards.drive_upright(env, **params).item() == 0
+
+
+@pytest.mark.parametrize("angle", [float("nan"), 59.0, 71.0])
+def test_transient_lean_rejects_unsafe_cutoffs(angle):
+    with pytest.raises(ValueError, match="max_tilt_deg"):
+        rewards.course_forward_speed(_drive_env(), max_tilt_deg=angle)
 
 
 def test_course_speed_rewards_signed_spawn_direction_not_body_direction_or_command():
@@ -318,10 +479,12 @@ def test_drive_lean_rejects_invalid_scales(key, value):
         rewards.drive_upright(_drive_env(), **params)
 
 
-def test_drive_recipe_uses_1200_additional_updates_in_workshop_and_runner_defaults():
-    from microduck_challenges.sprint_2m.env import DRIVE_SETTINGS, TRAINING_RECIPE
+def test_overnight_refine_budget_preserves_the_explicit_drive_recipe():
+    from microduck_challenges.sprint_2m.env import DRIVE_SETTINGS, REFINE_SETTINGS, TRAINING_RECIPE
 
-    assert TRAINING_RECIPE["max_iterations"] == 1200
+    assert TRAINING_RECIPE["max_iterations"] == REFINE_SETTINGS["max_iterations"] == 10000
+    assert REFINE_SETTINGS["save_interval"] == 250
+    assert REFINE_SETTINGS["learning_rate"] == 0.00005
     assert DRIVE_SETTINGS["max_iterations"] == 1200
     assert DRIVE_SETTINGS["save_interval"] == 25
     assert DRIVE_SETTINGS["learning_rate"] == 0.0001

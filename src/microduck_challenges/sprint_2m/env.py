@@ -113,6 +113,7 @@ from .rewards import (
     configure_0109_locomotion,
     configure_drive_locomotion,
     configure_reference_locomotion,
+    configure_refine_locomotion,
     configure_speed_locomotion,
     mark_actor_only_inference,
     select_sprint_checkpoint,
@@ -121,13 +122,15 @@ from .rewards import (
 TRAINING_RECIPE = challenge.load(__file__).recipe
 STAGE_SETTINGS = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
 TRAINING_STAGE = os.environ.get("MICRODUCK_SPRINT_STAGE", STAGE_SETTINGS["stage"])
-if TRAINING_STAGE not in ("baseline", "speed", "drive"):
+if TRAINING_STAGE not in ("baseline", "speed", "drive", "refine"):
     raise ValueError(f"Unknown Sprint training stage: {TRAINING_STAGE!r}")
 SPEED_SETTINGS = STAGE_SETTINGS["speed"]
 DRIVE_SETTINGS = STAGE_SETTINGS["drive"]
+REFINE_SETTINGS = STAGE_SETTINGS["refine"]
 SPEED_CHECKPOINT = None
 DRIVE_CHECKPOINT = None
-for _stage in ("speed", "drive"):
+REFINE_CHECKPOINT = None
+for _stage in ("speed", "drive", "refine"):
     _settings = STAGE_SETTINGS[_stage]
     for _key in ("max_iterations", "save_interval", "hold_iterations", "ramp_iterations"):
         _value = _settings[_key]
@@ -610,6 +613,10 @@ def make_env_cfg(
         if DRIVE_CHECKPOINT is None:
             raise RuntimeError("Select a compatible 5/5 baseline before forward-drive tuning")
         cfg = configure_drive_locomotion(cfg, DRIVE_SETTINGS, DRIVE_CHECKPOINT, NUM_STEPS_PER_ENV)
+    elif active_stage == "refine":
+        if REFINE_CHECKPOINT is None:
+            raise RuntimeError("Select a compatible 5/5 drive checkpoint before refinement")
+        cfg = configure_refine_locomotion(cfg, REFINE_SETTINGS, REFINE_CHECKPOINT, NUM_STEPS_PER_ENV)
     elif active_stage not in ("baseline", "source"):
         raise ValueError(f"Unknown Sprint environment stage: {active_stage!r}")
     if play:
@@ -661,16 +668,20 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     max_iterations=int(TRAINING_RECIPE["max_iterations"]),
 )
 
-if TRAINING_STAGE in ("speed", "drive"):
+if TRAINING_STAGE in ("speed", "drive", "refine"):
     _settings = STAGE_SETTINGS[TRAINING_STAGE]
     _selected = select_sprint_checkpoint(
         Path("logs/rsl_rl/sprint_2m"),
-        run_pattern=_settings["source_run"], stage="baseline",
+        run_pattern=re.escape(_settings["source_run"]),
+        stage="speed" if TRAINING_STAGE == "refine" else "baseline",
+        checkpoint=_settings.get("source_checkpoint"),
         expected_env=make_env_cfg(stage="source" if TRAINING_STAGE == "speed" else "baseline"),
         expected_agent=RL_CFG,
     )
     if TRAINING_STAGE == "speed":
         SPEED_CHECKPOINT = _selected
+    elif TRAINING_STAGE == "refine":
+        REFINE_CHECKPOINT = _selected
     else:
         DRIVE_CHECKPOINT = _selected
     _checkpoint_path = _selected["path"]
@@ -682,6 +693,8 @@ if TRAINING_STAGE in ("speed", "drive"):
     RL_CFG.max_iterations = _settings["max_iterations"]
     RL_CFG.save_interval = _settings["save_interval"]
     RL_CFG.algorithm.class_name = "microduck_challenges.sprint_2m.rewards:SprintSpeedPPO"
+    if TRAINING_STAGE == "refine":
+        RL_CFG.algorithm.class_name = "microduck_challenges.sprint_2m.rewards:SprintRefinePPO"
     RL_CFG.algorithm.learning_rate = _settings["learning_rate"]
     RL_CFG.algorithm.schedule = "fixed"
     print(f"[sprint {TRAINING_STAGE} config] selected training source {_checkpoint_path}; "
