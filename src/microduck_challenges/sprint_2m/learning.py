@@ -11,6 +11,7 @@ class SprintRefinePpoCfg(PpoWithSymmetryCfg):
     """Record intentional phase-boundary noise scaling in saved agent configs."""
 
     exploration_std_scale: float = 1.0
+    reward_profile: str = "A0"
 
 
 def phase_settings(training, phase):

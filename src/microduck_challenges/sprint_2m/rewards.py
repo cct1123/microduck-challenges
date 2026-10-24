@@ -28,6 +28,8 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules.distribution import GaussianDistribution
 
+from .experiments import apply_reward_profile, reward_overrides
+
 DISTANCE_M = 2.0
 TIME_LIMIT_S = 50.0
 SETTLE_S = 0.5
@@ -520,8 +522,10 @@ class SprintSpeedPPO(SprintPPO):
 class SprintRefinePPO(SprintSpeedPPO):
     """Fresh optimizer/runner iteration while preserving the source environment age."""
 
-    def __init__(self, *args, exploration_std_scale=1.0, **kwargs):
+    def __init__(self, *args, exploration_std_scale=1.0, reward_profile="A0", **kwargs):
         self.exploration_std_scale = self._noise_scale(exploration_std_scale)
+        reward_overrides(reward_profile)
+        self.reward_profile = reward_profile
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -532,7 +536,8 @@ class SprintRefinePPO(SprintSpeedPPO):
 
     def save(self):
         return {**super().save(),
-                "sprint_exploration_std_scale": getattr(self, "exploration_std_scale", 1.0)}
+                "sprint_exploration_std_scale": getattr(self, "exploration_std_scale", 1.0),
+                "sprint_reward_profile": getattr(self, "reward_profile", "A0")}
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
         if getattr(self, "_sprint_inference_only", False):
@@ -650,7 +655,7 @@ def configure_leg_freedom(cfg):
     return cfg
 
 
-def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
+def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24, *, reward_profile="A0"):
     """Validate a drive or mature refine source against an independent recipe."""
     # Construction metadata only: this does not select or invent policy evidence.
     baseline = {"source_env": _config_data(cfg),
@@ -662,6 +667,9 @@ def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
         raise ValueError("training.refine.free_legs must be boolean")
     source = selected["source_env"]
     source_class = selected["source_agent"]["algorithm"]["class_name"]
+    source_reward_profile = selected["source_agent"]["algorithm"].get("reward_profile", "A0")
+    reward_overrides(source_reward_profile)
+    reward_overrides(reward_profile)
     source_profile = deepcopy(cfg)
     if source_class == "microduck_challenges.sprint_2m.rewards:SprintRefinePPO":
         # Build the expected mature recipe from local baseline/settings, never
@@ -671,8 +679,11 @@ def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
             # Reconstruct an allowlisted profile; validate all its scalars and
             # semantics below rather than trusting the source's reward weights.
             source_profile = configure_leg_freedom(source_profile)
+        source_profile = apply_reward_profile(source_profile, source_reward_profile)
     elif source_class != "microduck_challenges.sprint_2m.rewards:SprintSpeedPPO":
         raise ValueError("Incompatible source algorithm for refine stage")
+    elif source_reward_profile != "A0":
+        raise ValueError("Speed-stage source cannot declare an experimental reward profile")
     canonical = _config_data(source_profile)
     for group in ("actor", "critic"):
         if list(source["observations"][group]["terms"]) != list(canonical["observations"][group]["terms"]):
@@ -705,6 +716,8 @@ def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
     params = source_profile.curriculum["speed_rewards"].params
     # Refine descendants restart PPO numbering, but inherit environment age.
     payload = torch.load(selected["path"], map_location="cpu", weights_only=False)
+    if payload.get("sprint_reward_profile", "A0") != source_reward_profile:
+        raise ValueError("Incompatible saved reward profile and source agent configuration")
     source_steps = (payload.get("infos") or {}).get("env_state", {}).get("common_step_counter")
     if type(source_steps) is not int or source_steps <= 0:
         raise ValueError("Refine requires the saved source environment clock")
@@ -715,7 +728,8 @@ def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
     if SprintRefinePPO._noise_scale(saved_noise) != SprintRefinePPO._noise_scale(declared_noise):
         raise ValueError("Incompatible saved noise phase and source agent configuration")
     cfg = _mature_refine_recipe(cfg, settings)
-    return configure_leg_freedom(cfg) if free_legs else cfg
+    cfg = configure_leg_freedom(cfg) if free_legs else cfg
+    return apply_reward_profile(cfg, reward_profile)
 
 
 def _mature_refine_recipe(cfg, settings):

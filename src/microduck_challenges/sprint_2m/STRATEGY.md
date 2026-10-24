@@ -1,5 +1,84 @@
 # Sprint: discover freely, consolidate only verified gains
 
+## Opt-in reward experiments and plateau audit
+
+Default Workshop training remains **A0**, unchanged. The new campaign option
+`--reward-profile` selects exactly one independently defined experiment:
+
+| Profile | Difference from the mature A0 recipe |
+|---|---|
+| `A0` | No reward override (control) |
+| `A1` | `track_linear_velocity` weight -> 0 |
+| `B1` | `air_time` weight -> 3; does NOT include A1 |
+| `B2` | `speed_forward` weight -> 18; does NOT include A1 or B1 |
+
+These are unvalidated hypotheses, not demonstrated speed gains. First compare
+A0/A1 from the same exact source and matched transition budgets. Do not combine
+weight changes or infer a gain from a larger total reward. Source metadata and
+checkpoint markers are validated against an independently built source recipe
+BEFORE target overrides; applicable curriculum endpoints are frozen so resets
+cannot undo the experiment. Saved agent configuration and `.pt` files record the
+reward profile. A legacy checkpoint without a marker means A0. Promotion to
+exploitation must retain the source's reward profile; changing it needs a new
+exploration/assessment, not an old approval applied to a new reward.
+
+The CLI is non-launching without the existing explicit `run --execute` switch:
+
+```bash
+uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile A1
+```
+
+Raw training can opt in using `MICRODUCK_SPRINT_REWARD_PROFILE=A1` (refine stage
+only), but the campaign remains the bounded, locked, provenance-recorded path.
+No TOML/Workshop defaults need changing. A running trainer retains its already
+loaded recipe and is never restarted by inspecting/planning an experiment.
+
+Read existing logs without inference, rollout or training:
+
+```bash
+uv run --group workshop python -m microduck_challenges.sprint_2m.diagnostics \
+  --run logs/rsl_rl/sprint_2m/2026-10-24_16-50-33_run-1024-1650 \
+  --iteration 264 --radius 10 --output logs/verification/my-reward-audit
+```
+
+The audit requires the EXACT requested iteration, includes all saved reward
+terms, reports missing data rather than inventing zeros, and writes JSON/Markdown
+to a new directory outside the source run. `Episode_Reward` values use weighted
+episode sums divided by maximum episode seconds, while `Train/mean_reward` uses
+a rolling 100-completed-episode window. They cannot be added together to explain
+the headline return. Saved startup weights are not assumed live for a changing
+curriculum; affected terms are excluded from unweighting estimates. The optional
+fixed-data weight estimates are not retrained behaviour or a full trajectory
+counterfactual. One reward point is not evidence of a plateau.
+
+### Slim post-development checks
+
+The seven legacy Sprint-only test files are replaced by ONE
+`tests/test_sprint_lite.py`, written after development. Shared/package/actuator
+and other-challenge tests remain unchanged. The slim suite uses generated local
+fixtures, no historical policy inventory, no simulator rollout and no GPU/network
+requests. It covers profiles/curricula, strict restore, safety gates, ONNX parity,
+score integrity and audit accounting. To avoid the training registry selecting an
+archived warm-start source at import on a clean clone, set
+`MICRODUCK_SPRINT_STAGE=baseline` for portable test collection.
+
+```bash
+uv run --group workshop pytest tests/test_sprint_lite.py
+uv run --group workshop pytest
+```
+
+Before a long training, run the suite and one separate two-env/two-update CPU
+smoke/export check in a fresh directory:
+
+```bash
+uv run --group workshop python -m microduck_challenges.sprint_2m.campaign smoke \
+  --phase explore --reward-profile A1 --output logs/verification/my-a1-smoke
+```
+
+This verifies software/restore/export only, not improved racing performance.
+Finite-race objective, teacher imitation/DAgger, and model compression remain
+later separately authorized stages, not automatically started by this feature.
+
 ## Goal and invariant
 
 Target: a legal **2 m finish averaging 0.8 s**, without sacrificing reliable completion.

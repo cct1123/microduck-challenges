@@ -21,6 +21,7 @@ import yaml
 
 from . import env as sprint_env
 from .learning import phase_settings
+from .experiments import REWARD_PROFILES, reward_overrides
 from .promotion import digest, promotion_decision, read_report, require_promotion, runtime_signature, saved_checkpoints, summarize
 from .rewards import _ConfigLoader, _config_data, configure_refine_locomotion, select_sprint_checkpoint
 
@@ -49,11 +50,16 @@ def selected_source(source=None):
     return selected
 
 
-def make_plan(phase, source=None, promotion_path=None, iterations=None, seed=None):
+def make_plan(phase, source=None, promotion_path=None, iterations=None, seed=None, reward_profile="A0"):
+    overrides = reward_overrides(reward_profile)
     controls = phase_settings(sprint_env.STAGE_SETTINGS, phase)
     if promotion_path and source is None:
         source = read_report(promotion_path)["candidate_path"]
-    source = selected_source(source)["path"]
+    selected = selected_source(source)
+    source = selected["path"]
+    source_profile = selected["source_agent"]["algorithm"].get("reward_profile", "A0")
+    if phase == "exploit" and reward_profile != source_profile:
+        raise ValueError("Exploitation must preserve the promoted source reward profile")
     budget = controls["max_iterations"]
     iterations = budget if iterations is None else iterations
     if type(iterations) is not int or not 1 <= iterations <= budget:
@@ -62,17 +68,27 @@ def make_plan(phase, source=None, promotion_path=None, iterations=None, seed=Non
     if type(seed) is not int or seed < 0:
         raise ValueError("Training seed must be a nonnegative integer")
     environment = {"MICRODUCK_SPRINT_STAGE": "refine", "MICRODUCK_SPRINT_PHASE": phase,
-                   "MICRODUCK_SPRINT_SOURCE": str(source)}
+                   "MICRODUCK_SPRINT_SOURCE": str(source),
+                   "MICRODUCK_SPRINT_REWARD_PROFILE": reward_profile}
     if promotion_path:
         require_promotion(promotion_path, source, sprint_env.STAGE_SETTINGS["gate"])
         environment["MICRODUCK_SPRINT_PROMOTION"] = str(Path(promotion_path).resolve())
-    name = f"{phase}-s{seed}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    name = f"{phase}-{reward_profile}-s{seed}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     command = [sys.executable, "-m", "mjlab.scripts.train", TASK,
                "--gpu-ids", "all", "--env.scene.num-envs", str(sprint_env.TRAINING_RECIPE["num_envs"]),
                "--agent.max-iterations", str(iterations), "--agent.save-interval", str(controls["save_interval"]),
                "--agent.seed", str(seed), "--agent.logger", "tensorboard", "--agent.upload-model", "False",
                "--agent.run-name", name]
-    return {"phase": phase, "source": str(source), "source_sha256": digest(source),
+    target = configure_refine_locomotion(sprint_env.make_env_cfg(stage="baseline"),
+                                         sprint_env.REFINE_SETTINGS, selected, reward_profile=reward_profile)
+    return {"phase": phase, "reward_profile": reward_profile, "reward_overrides": overrides,
+            "source_reward_profile": source_profile,
+            "source_reward_weights": {k: v["weight"] for k, v in selected["source_env"]["rewards"].items()},
+            "target_reward_weights": {k: v.weight for k, v in target.rewards.items()},
+            "source": str(source), "source_sha256": digest(source),
+            "source_config_files": {str(p): digest(p) for p in
+                                    (source.parent / "params/env.yaml", source.parent / "params/agent.yaml",
+                                     source.parent / "provenance.json", selected["result_path"])},
             "max_iterations": iterations, "seed": seed, "controls": controls,
             "source_files": {str(p): digest(p) for p in sorted(Path(__file__).parent.iterdir())
                              if p.suffix in (".py", ".toml")},
@@ -98,6 +114,10 @@ def export_actor(checkpoint, output):
     if actor_cfg != _config_data(sprint_env.RL_CFG)["actor"]:
         raise ValueError("Unsupported saved actor architecture/normalization configuration")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    reward_profile = agent.get("algorithm", {}).get("reward_profile", "A0")
+    reward_overrides(reward_profile)
+    if payload.get("sprint_reward_profile", "A0") != reward_profile:
+        raise ValueError("Export reward profile disagrees with saved agent configuration")
     state = dict(payload["actor_state_dict"])
     for old, new in (("std", "distribution.std_param"), ("log_std", "distribution.log_std_param")):
         if old in state:
@@ -130,6 +150,8 @@ def export_actor(checkpoint, output):
     if digest(checkpoint) != before:
         raise ValueError("Source checkpoint changed during export")
     return {"checkpoint_sha256": before, "onnx_sha256": digest(output), "parity_cases": 8,
+            "reward_profile": reward_profile,
+            "source_agent_sha256": digest(checkpoint.parent / "params/agent.yaml"),
             "input_shape": [1, 61], "output_shape": [1, 14]}
 
 
@@ -234,7 +256,7 @@ def assess(run, incumbent, output):
     return report
 
 
-def smoke(phase, source, output):
+def smoke(phase, source, output, reward_profile="A0"):
     """Two real CPU updates of phase controls; this does not approve racing fitness."""
     import torch
     from mjlab.scripts.train import TrainConfig, run_train
@@ -250,12 +272,14 @@ def smoke(phase, source, output):
     controls = phase_settings(sprint_env.STAGE_SETTINGS, phase)
     cfg = replace(TrainConfig.from_task(TASK), gpu_ids=None,
                   env=configure_refine_locomotion(sprint_env.make_env_cfg(stage="baseline"),
-                                                  sprint_env.REFINE_SETTINGS, selected))
+                                                  sprint_env.REFINE_SETTINGS, selected,
+                                                  reward_profile=reward_profile))
     cfg.env.scene.num_envs = 2
     cfg.agent.max_iterations, cfg.agent.save_interval = 2, 1
     cfg.agent.seed, cfg.agent.logger, cfg.agent.upload_model = 4, "tensorboard", False
     cfg.agent.load_run = "^" + re.escape(source.parent.name) + "$"
     cfg.agent.load_checkpoint = "^" + re.escape(source.name) + "$"
+    setattr(getattr(cfg.agent, "algorithm"), "reward_profile", reward_profile)
     for key in ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale"):
         setattr(getattr(cfg.agent, "algorithm"), key, controls[key])
     original = MicroduckOnPolicyRunner.load
@@ -263,6 +287,16 @@ def smoke(phase, source, output):
     before = digest(source)
     source_clock = saved["infos"]["env_state"]["common_step_counter"]
     restored_tensors = 0
+    live_reward_checks = 0
+    expected_weights = {k: v.weight for k, v in cfg.env.rewards.items()}
+
+    def check_live_weights(runner):
+        nonlocal live_reward_checks
+        manager = runner.env.unwrapped.reward_manager
+        actual = {name: manager.get_term_cfg(name).weight for name in expected_weights}
+        if actual != expected_weights:
+            raise ValueError("Live reward weights changed from the requested experiment")
+        live_reward_checks += 1
 
     def checked_load(runner, path, *args, **kwargs):
         nonlocal restored_tensors
@@ -280,9 +314,19 @@ def smoke(phase, source, output):
         if (runner.current_learning_iteration != 0 or runner.alg.optimizer.state
                 or runner.env.unwrapped.common_step_counter != source_clock):
             raise ValueError("Smoke warm-start clocks or fresh optimizer are incorrect")
+        check_live_weights(runner)
+        original_step = runner.env.step
+
+        def checked_step(*step_args, **step_kwargs):
+            outcome = original_step(*step_args, **step_kwargs)
+            check_live_weights(runner)
+            return outcome
+
+        runner.env.step = checked_step
         return result
 
     previous_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+    previous_threads = torch.get_num_threads()
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     torch.set_num_threads(2)
     setattr(MicroduckOnPolicyRunner, "load", checked_load)
@@ -290,6 +334,7 @@ def smoke(phase, source, output):
         run_train(TASK, cfg, log_dir)
     finally:
         setattr(MicroduckOnPolicyRunner, "load", original)
+        torch.set_num_threads(previous_threads)
         if previous_cuda is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
@@ -297,13 +342,20 @@ def smoke(phase, source, output):
     final = torch.load(log_dir / "model_1.pt", map_location="cpu", weights_only=False)
     if final["infos"]["env_state"]["common_step_counter"] != source_clock + 48:
         raise ValueError("Smoke did not complete both 24-step updates")
+    if final.get("sprint_reward_profile") != reward_profile:
+        raise ValueError("Smoke did not persist the selected reward profile")
+    if live_reward_checks != 49:
+        raise ValueError("Smoke did not verify live rewards at restore and every control step")
     acc = EventAccumulator(str(log_dir), size_guidance={"scalars": 0}).Reload()
     scalars = [e.value for tag in acc.Tags()["scalars"] for e in acc.Scalars(tag)]
     if not scalars or not all(math.isfinite(value) for value in scalars) or digest(source) != before:
         raise ValueError("Nonfinite smoke metrics or changed source")
     export = export_actor(log_dir / "model_1.pt", output / "verified.onnx")
-    report = {"phase": phase, "controls": controls, "device": "cpu", "updates": 2,
+    report = {"phase": phase, "reward_profile": reward_profile,
+              "reward_weights": {k: v.weight for k, v in cfg.env.rewards.items()},
+              "controls": controls, "device": "cpu", "updates": 2,
               "restored_state_tensors": restored_tensors, "source": str(source),
+              "live_reward_checks": live_reward_checks,
               "source_unchanged": True, "finite_scalar_values": len(scalars), "export": export}
     write_json(output / "smoke.json", report)
     return report
@@ -380,10 +432,11 @@ def _run_bounded(plan, output):
     with (output / "tests.log").open("w") as stream:
         subprocess.run([sys.executable, "-m", "pytest", "-q"], stdout=stream,
                         stderr=subprocess.STDOUT, check=True)
-    smoke(plan["phase"], plan["source"], output / "smoke")
+    smoke(plan["phase"], plan["source"], output / "smoke", plan.get("reward_profile", "A0"))
     if active_trainers():
         raise ValueError("Another trainer started during preflight; refusing to launch")
     if (digest(plan["source"]) != plan["source_sha256"]
+            or any(digest(p) != value for p, value in plan.get("source_config_files", {}).items())
             or any(digest(p) != value for p, value in plan["source_files"].items())):
         raise ValueError("Source checkpoint or scripts changed during preflight")
     journal = {"plan": plan, "state": "reserved", "pid": None}
@@ -429,6 +482,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "run", "smoke", "assess"))
     parser.add_argument("--phase", choices=("explore", "exploit"), default="explore")
+    parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default="A0",
+                        help="A0 control, A1 no linear tracking, B1 less air time, B2 stronger speed (not combined)")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--promotion", type=Path)
     parser.add_argument("--iterations", type=int)
@@ -447,9 +502,9 @@ def main():
         elif args.action == "smoke":
             if not args.output:
                 parser.error("smoke needs a new --output directory")
-            print(json.dumps(smoke(args.phase, args.source, args.output), indent=2))
+            print(json.dumps(smoke(args.phase, args.source, args.output, args.reward_profile), indent=2))
         else:
-            plan = make_plan(args.phase, args.source, args.promotion, args.iterations, args.seed)
+            plan = make_plan(args.phase, args.source, args.promotion, args.iterations, args.seed, args.reward_profile)
             if args.action == "run" and args.execute:
                 if not args.output:
                     parser.error("run --execute needs a new --output directory")

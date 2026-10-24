@@ -121,6 +121,7 @@ from .rewards import (
 )
 from .learning import SprintRefinePpoCfg, phase_settings
 from .promotion import require_promotion
+from .experiments import reward_overrides
 
 TRAINING_RECIPE = challenge.load(__file__).recipe
 STAGE_SETTINGS = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
@@ -130,6 +131,10 @@ if TRAINING_STAGE not in ("baseline", "speed", "drive", "refine"):
 SPEED_SETTINGS = STAGE_SETTINGS["speed"]
 DRIVE_SETTINGS = STAGE_SETTINGS["drive"]
 TRAINING_PHASE = os.environ.get("MICRODUCK_SPRINT_PHASE", STAGE_SETTINGS["phase"])
+TRAINING_REWARD_PROFILE = os.environ.get("MICRODUCK_SPRINT_REWARD_PROFILE", "A0")
+reward_overrides(TRAINING_REWARD_PROFILE)
+if TRAINING_STAGE != "refine" and TRAINING_REWARD_PROFILE != "A0":
+    raise ValueError("Reward experiments require the strict refinement warm-start path")
 REFINE_SETTINGS = {**STAGE_SETTINGS["refine"], **phase_settings(STAGE_SETTINGS, TRAINING_PHASE)}
 if _source_override := os.environ.get("MICRODUCK_SPRINT_SOURCE"):
     _source_path = Path(_source_override)
@@ -176,6 +181,7 @@ def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
 def make_env_cfg(
     play: bool = False,
     *, stage: str | None = None,
+    reward_profile: str | None = None,
 ) -> ManagerBasedRlEnvCfg:
     """The sprint's training environment."""
 
@@ -615,6 +621,10 @@ def make_env_cfg(
     # Baseline behavior is unchanged. A speed stage is a separately launched run.
     cfg = configure_reference_locomotion(cfg, knobs, NUM_STEPS_PER_ENV)
     active_stage = TRAINING_STAGE if stage is None else stage
+    if reward_profile is not None:
+        reward_overrides(reward_profile)
+        if active_stage != "refine" and reward_profile != "A0":
+            raise ValueError("Reward experiments require the strict refinement warm-start path")
     if active_stage in ("speed", "source"):
         cfg = configure_0109_locomotion(cfg)
     if active_stage == "speed":
@@ -628,7 +638,10 @@ def make_env_cfg(
     elif active_stage == "refine":
         if REFINE_CHECKPOINT is None:
             raise RuntimeError("Select a compatible 5/5 drive checkpoint before refinement")
-        cfg = configure_refine_locomotion(cfg, REFINE_SETTINGS, REFINE_CHECKPOINT, NUM_STEPS_PER_ENV)
+        cfg = configure_refine_locomotion(
+            cfg, REFINE_SETTINGS, REFINE_CHECKPOINT, NUM_STEPS_PER_ENV,
+            reward_profile=TRAINING_REWARD_PROFILE if reward_profile is None else reward_profile,
+        )
     elif active_stage not in ("baseline", "source"):
         raise ValueError(f"Unknown Sprint environment stage: {active_stage!r}")
     if play:
@@ -702,6 +715,9 @@ if TRAINING_STAGE in ("speed", "drive", "refine"):
     if TRAINING_STAGE == "speed":
         SPEED_CHECKPOINT = _selected
     elif TRAINING_STAGE == "refine":
+        if (TRAINING_PHASE == "exploit" and TRAINING_REWARD_PROFILE
+                != _selected["source_agent"]["algorithm"].get("reward_profile", "A0")):
+            raise ValueError("Exploitation must preserve the promoted source reward profile")
         REFINE_CHECKPOINT = _selected
     else:
         DRIVE_CHECKPOINT = _selected
@@ -721,6 +737,7 @@ if TRAINING_STAGE in ("speed", "drive", "refine"):
                "entropy_coef": _settings["entropy_coef"],
                "clip_param": _settings["clip_param"]},
             exploration_std_scale=_settings["exploration_std_scale"],
+            reward_profile=TRAINING_REWARD_PROFILE,
         )
     RL_CFG.algorithm.learning_rate = _settings["learning_rate"]
     RL_CFG.algorithm.schedule = "fixed"
