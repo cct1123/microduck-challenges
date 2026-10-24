@@ -1,8 +1,9 @@
 """Reference locomotion, warm-started fine-tuning and Sprint checkpoint selection.
 
 The TOML defaults to refinement of a compatible, fully-ramped 5/5 drive policy.
-Refinement preserves the source environment age and mature reward weights;
-the older speed/drive stages restart their reward ramps on a new stage clock.
+Refinement preserves source environment age and validates mature reward weights;
+the explicit free_legs option then removes leg pose and leg smoothing guidance.
+The older speed/drive stages restart their reward ramps on a new stage clock.
 The former race functions remain importable for saved experiment configurations;
 their clock, mastery gate and terminal costs are not active in the new recipe.
 """
@@ -594,16 +595,76 @@ def configure_speed_locomotion(cfg, settings, selected, rollout_steps=24):
     return cfg
 
 
+class HeadActionRateL2:
+    """Keep head/neck smoothing without taxing any of the ten leg actions."""
+
+    def __init__(self, cfg, env):
+        del cfg
+        manager = env.action_manager
+        names = manager.get_term("joint_pos").target_names
+        head_names = ("neck_pitch", "head_pitch", "head_yaw", "head_roll")
+        if (list(manager.active_terms) != ["joint_pos"] or len(names) != 14
+                or manager.action.shape[-1] != len(names) or len(set(names)) != len(names)
+                or any(names.count(name) != 1 for name in head_names)):
+            raise ValueError("head smoothing requires an unambiguous 14-action joint_pos layout")
+        self.indices = torch.tensor([names.index(name) for name in head_names],
+                                    dtype=torch.long, device=env.device)
+
+    def __call__(self, env):
+        manager = env.action_manager
+        delta = manager.action[:, self.indices] - manager.prev_action[:, self.indices]
+        return delta.square().sum(dim=-1)
+
+
+def configure_leg_freedom(cfg):
+    """Remove leg pose/action-rate preferences, not mechanical limits or guards."""
+    cfg.rewards["pose"].weight = 0.0
+    cfg.curriculum["speed_rewards"].params["targets"]["pose"] = (0.0, 0.0)
+    cfg.rewards["action_rate_l2"].func = HeadActionRateL2
+    return cfg
+
+
 def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
-    """Continue a fully-ramped drive recipe using known callables, never YAML objects."""
+    """Validate a drive or mature refine source against an independent recipe."""
     # Construction metadata only: this does not select or invent policy evidence.
     baseline = {"source_env": _config_data(cfg),
                 "source_agent": {"num_steps_per_env": rollout_steps},
                 "checkpoint": settings["source_baseline_checkpoint"]}
     cfg = configure_drive_locomotion(cfg, settings, baseline, rollout_steps)
-    canonical = _config_data(cfg)
+    free_legs = settings.get("free_legs", False)
+    if type(free_legs) is not bool:
+        raise ValueError("training.refine.free_legs must be boolean")
     source = selected["source_env"]
-    source_steps = (selected["checkpoint"] + 1) * selected["source_agent"]["num_steps_per_env"]
+    source_class = selected["source_agent"]["algorithm"]["class_name"]
+    source_profile = deepcopy(cfg)
+    if source_class == "microduck_challenges.sprint_2m.rewards:SprintRefinePPO":
+        # Build the expected mature recipe from local baseline/settings, never
+        # from the source being validated (including its weights and guard).
+        source_profile = _mature_refine_recipe(source_profile, settings)
+        if source["rewards"]["action_rate_l2"]["func"] == f"{__name__}.HeadActionRateL2":
+            # Reconstruct an allowlisted profile; validate all its scalars and
+            # semantics below rather than trusting the source's reward weights.
+            source_profile = configure_leg_freedom(source_profile)
+    elif source_class != "microduck_challenges.sprint_2m.rewards:SprintSpeedPPO":
+        raise ValueError("Incompatible source algorithm for refine stage")
+    canonical = _config_data(source_profile)
+    for group in ("actor", "critic"):
+        if list(source["observations"][group]["terms"]) != list(canonical["observations"][group]["terms"]):
+            raise ValueError(f"Incompatible source {group} observation order")
+    if list(source["actions"]) != list(canonical["actions"]):
+        raise ValueError("Incompatible source action order")
+    for key in ("observations", "actions", "sim", "decimation", "events", "commands",
+                "terminations", "episode_length_s", "is_finite_horizon", "scale_rewards_by_dt"):
+        if source[key] != canonical[key]:
+            raise ValueError(f"Incompatible source {key} for refine stage")
+    # Batch size is an execution choice, not a physics change.
+    source_scene, canonical_scene = deepcopy(source["scene"]), deepcopy(canonical["scene"])
+    for scene in (source_scene, canonical_scene):
+        scene.pop("num_envs", None)
+        if scene.get("terrain") is not None:
+            scene["terrain"].pop("num_envs", None)
+    if source_scene != canonical_scene:
+        raise ValueError("Incompatible source scene for refine stage")
     if source["rewards"].keys() != canonical["rewards"].keys():
         raise ValueError("Incompatible source reward set for refine stage")
     for name, term in canonical["rewards"].items():
@@ -611,23 +672,31 @@ def configure_refine_locomotion(cfg, settings, selected, rollout_steps=24):
         if saved["func"] != term["func"] or saved["params"] != term["params"]:
             raise ValueError(f"Incompatible source reward semantics: {name}")
         weight = saved["weight"]
-        if type(weight) not in (int, float) or not math.isfinite(weight):
+        if type(weight) not in (int, float) or not math.isfinite(weight) or weight != term["weight"]:
             raise ValueError(f"Invalid source reward weight: {name}")
-        cfg.rewards[name].weight = weight
     if source["curriculum"] != canonical["curriculum"]:
         raise ValueError("Incompatible source curriculum for refine stage")
-    # Keep canonical functions and resolved entity configs; copy primitive params only.
-    for name, term in source["curriculum"].items():
-        cfg.curriculum[name].params = deepcopy(term["params"])
-    params = cfg.curriculum["speed_rewards"].params
+    params = source_profile.curriculum["speed_rewards"].params
+    # Refine descendants restart PPO numbering, but inherit environment age.
+    payload = torch.load(selected["path"], map_location="cpu", weights_only=False)
+    source_steps = (payload.get("infos") or {}).get("env_state", {}).get("common_step_counter")
+    if type(source_steps) is not int or source_steps <= 0:
+        raise ValueError("Refine requires the saved source environment clock")
     if source_steps < params["hold_steps"] + params["ramp_steps"]:
         raise ValueError("Refine requires a fully-ramped source checkpoint")
+    cfg = _mature_refine_recipe(cfg, settings)
+    return configure_leg_freedom(cfg) if free_legs else cfg
+
+
+def _mature_refine_recipe(cfg, settings):
+    """Apply only the explicit refinement recipe, independent of saved metadata."""
+    params = cfg.curriculum["speed_rewards"].params
     # Environment construction resets before runner.load restores the source
     # clock. Keep both weights and the logged phase mature during that reset.
     params["initial_fraction"] = 1.0
     for name, (initial, final) in params["targets"].items():
         cfg.rewards[name].weight = initial + (final - initial)
-    # Validate the source's original recipe before applying this deliberate change.
+    # Retain the original drive-to-refine transition as well as consolidation.
     lean_variance = settings["lean_forward_variance"]
     max_tilt = settings["lean_max_tilt_deg"]
     if (not math.isfinite(lean_variance) or lean_variance < settings["forward_variance"]

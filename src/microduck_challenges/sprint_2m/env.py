@@ -256,8 +256,8 @@ def make_env_cfg(
 
     # Velocity-based pushes for robustness training
     if ENABLE_VELOCITY_PUSHES:
-        # In play mode, use shorter interval for better visibility
-        interval = (0.5, 1.0) if play else VELOCITY_PUSH_INTERVAL_S
+        # Validate the training physics before applying play-only overrides.
+        interval = VELOCITY_PUSH_INTERVAL_S
 
         cfg.events["push_robot"] = EventTermCfg(
             func=mdp.push_by_setting_velocity,
@@ -620,6 +620,8 @@ def make_env_cfg(
     elif active_stage not in ("baseline", "source"):
         raise ValueError(f"Unknown Sprint environment stage: {active_stage!r}")
     if play:
+        if ENABLE_VELOCITY_PUSHES:
+            cfg.events["push_robot"].interval_range_s = (0.5, 1.0)
         cfg.events["actor_only_inference"] = EventTermCfg(
             func=mark_actor_only_inference, mode="startup",
         )

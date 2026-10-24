@@ -34,10 +34,11 @@ max   = 6.0
 stage = "refine"
 
 [training.refine]
-# Lower LR and permit deeper transient forward lean; keep mature reward weights.
-source_run = "2026-10-23_23-38-30_run-1023-2338"
-# Conservative consolidation candidate; never silently replace it with model_1199.
-source_checkpoint = 1025
+# Preserve source age and mature rewards while freeing the legs.
+free_legs = true
+source_run = "2026-10-24_01-21-50_run-1024-0121"
+# Retained winner; never silently substitute the final model_9999.
+source_checkpoint = 8250
 max_iterations = 10000
 save_interval = 250
 learning_rate = 0.00005

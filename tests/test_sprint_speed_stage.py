@@ -16,6 +16,81 @@ from microduck_challenges.sprint_2m import rewards
 from microduck_challenges.sprint_2m.env import RL_CFG, SPEED_SETTINGS, make_env_cfg
 
 
+def test_refine_accepts_saved_refinement_without_restarting_its_clock():
+    from pathlib import Path
+    from microduck_challenges.sprint_2m.env import REFINE_SETTINGS
+
+    run = Path("logs/rsl_rl/sprint_2m/2026-10-24_01-21-50_run-1024-0121")
+    selected = rewards.select_sprint_checkpoint(
+        run.parent, run_pattern=run.name, checkpoint=8250, stage="speed",
+        expected_env=make_env_cfg(stage="baseline"), expected_agent=RL_CFG,
+    )
+    cfg = rewards.configure_refine_locomotion(
+        make_env_cfg(stage="baseline"), {**REFINE_SETTINGS, "free_legs": False}, selected,
+    )
+    actual = rewards._config_data(cfg)
+    for key in ("rewards", "curriculum", "terminations", "observations", "actions", "sim"):
+        assert actual[key] == selected["source_env"][key]
+
+
+@pytest.fixture(params=[("2026-10-23_23-38-30_run-1023-2338", 1025),
+                        ("2026-10-24_01-21-50_run-1024-0121", 8250)])
+def refine_source(request):
+    from pathlib import Path
+
+    run, checkpoint = request.param
+    return rewards.select_sprint_checkpoint(
+        Path("logs/rsl_rl/sprint_2m"), run_pattern=run, checkpoint=checkpoint,
+        stage="speed", expected_env=make_env_cfg(stage="baseline"), expected_agent=RL_CFG,
+    )
+
+
+def test_refine_accepts_both_profiles_using_saved_age_not_iteration(refine_source):
+    from microduck_challenges.sprint_2m.env import REFINE_SETTINGS
+
+    refine_source["checkpoint"] = 0  # PPO numbering does not establish maturity.
+    cfg = rewards.configure_refine_locomotion(make_env_cfg(stage="baseline"), REFINE_SETTINGS, refine_source)
+    assert cfg.rewards["speed_forward"].weight == 12.0
+    assert cfg.curriculum["speed_rewards"].params["initial_fraction"] == 1.0
+
+
+@pytest.mark.parametrize("path,value", [
+    (("rewards", "upright", "params", "forward_variance"), 0.75),
+    (("rewards", "speed_forward", "weight"), 13.0),
+    (("rewards", "heading_hold", "weight"), 0.0),
+    (("rewards", "upright", "func"), "arbitrary.function"),
+    (("curriculum", "speed_rewards", "params", "ramp_steps"), 24),
+    (("terminations", "fell_over", "params", "limit_angle"), 2.0),
+    (("terminations", "time_out", "time_out"), False),
+    (("actions", "joint_pos", "scale"), 2.0),
+    (("sim", "mujoco", "iterations"), 99),
+    (("events", "push_robot", "interval_range_s"), [1.0, 2.0]),
+    (("scene", "terrain", "env_spacing"), 9.0),
+    (("commands", "twist", "rel_standing_envs"), 0.5),
+])
+def test_refine_rejects_recipe_mismatch_for_both_profiles(refine_source, path, value):
+    from microduck_challenges.sprint_2m.env import REFINE_SETTINGS
+
+    target = refine_source["source_env"]
+    for key in path[:-1]:
+        target = target[key]
+    assert path[-1] in target
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match="[Ii]ncompatible|Invalid source reward"):
+        rewards.configure_refine_locomotion(make_env_cfg(stage="baseline"), REFINE_SETTINGS, refine_source)
+
+
+@pytest.mark.parametrize("clock", [None, 0, True, 5999])
+def test_refine_validates_saved_age_even_with_large_checkpoint_number(refine_source, tmp_path, clock):
+    from microduck_challenges.sprint_2m.env import REFINE_SETTINGS
+
+    artifact = tmp_path / "clock-only.pt"
+    torch.save({"infos": {"env_state": {"common_step_counter": clock}}}, artifact)
+    refine_source.update(path=artifact, checkpoint=999999)
+    with pytest.raises(ValueError, match="source environment clock|fully-ramped"):
+        rewards.configure_refine_locomotion(make_env_cfg(stage="baseline"), REFINE_SETTINGS, refine_source)
+
+
 def test_default_refine_selects_latest_winner_not_original_baseline():
     from microduck_challenges.sprint_2m import env as sprint_env
 
@@ -23,8 +98,8 @@ def test_default_refine_selects_latest_winner_not_original_baseline():
     if sprint_env.TRAINING_STAGE != "refine":
         pytest.skip("explicit archived-stage test process")
     selected = sprint_env.REFINE_CHECKPOINT
-    assert selected["path"].parent.name == "2026-10-23_23-38-30_run-1023-2338"
-    assert selected["checkpoint"] == 1025 and selected["stage"] == "speed"
+    assert selected["path"].parent.name == "2026-10-24_01-21-50_run-1024-0121"
+    assert selected["checkpoint"] == 8250 and selected["stage"] == "speed"
     assert RL_CFG.resume and RL_CFG.max_iterations == 10000
     assert RL_CFG.seed == 2 and RL_CFG.save_interval == 250
     assert RL_CFG.algorithm.learning_rate == 5e-5
@@ -35,8 +110,9 @@ def test_default_refine_selects_latest_winner_not_original_baseline():
     assert cfg.rewards["speed_forward"].weight == 12.0
     assert cfg.rewards["head_pose_tracking"].weight == 0.5
     assert cfg.rewards["head_pose_bias"].weight == 1.0
-    assert cfg.rewards["pose"].weight == 0.6
+    assert cfg.rewards["pose"].weight == 0.0
     assert cfg.rewards["action_rate_l2"].weight == pytest.approx(-0.3)
+    assert cfg.rewards["action_rate_l2"].func is rewards.HeadActionRateL2
     assert cfg.rewards["upright"].params["forward_variance"] == 0.8
     assert cfg.rewards["upright"].params["max_tilt_deg"] == 70.0
     assert cfg.rewards["speed_forward"].params["max_tilt_deg"] == 70.0
@@ -56,6 +132,7 @@ def test_refine_starts_mature_before_the_runner_restores_the_source_clock():
     assert rewards.speed_reward_curriculum(env, None, **params).item() == 1.0
     assert terms["speed_forward"].weight == 12.0
     assert terms["action_rate_l2"].weight == pytest.approx(-0.3)
+    assert terms["pose"].weight == 0.0
 
 
 def test_explicit_checkpoint_filter_never_substitutes_faster_or_invalid_result(tmp_path, source_cfg):
@@ -479,7 +556,7 @@ def test_drive_lean_rejects_invalid_scales(key, value):
         rewards.drive_upright(_drive_env(), **params)
 
 
-def test_overnight_refine_budget_preserves_the_explicit_drive_recipe():
+def test_consolidation_budget_preserves_the_explicit_drive_recipe():
     from microduck_challenges.sprint_2m.env import DRIVE_SETTINGS, REFINE_SETTINGS, TRAINING_RECIPE
 
     assert TRAINING_RECIPE["max_iterations"] == REFINE_SETTINGS["max_iterations"] == 10000
