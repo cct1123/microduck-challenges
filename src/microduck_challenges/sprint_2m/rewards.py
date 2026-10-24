@@ -1,4 +1,9 @@
-"""Sprint-specific reward shaping; the policy observation/action contract is unchanged."""
+"""Reference locomotion configuration and legacy Sprint checkpoint helpers.
+
+Only configure_reference_locomotion is selected by the current env factory.
+The former race functions remain importable for saved experiment configurations;
+their clock, mastery gate and terminal costs are not active in the new recipe.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import math
 
 import mujoco
 import torch
-from mjlab.managers import ObservationTermCfg, RewardTermCfg, TerminationTermCfg
+from mjlab.managers import CurriculumTermCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.velocity import mdp
 from mjlab_microduck.tasks import mdp as microduck_mdp
@@ -21,6 +26,124 @@ TIME_COST_WEIGHT = 0.1
 MASTERY_FINISH_RATE = 0.8
 MASTERY_MIN_EPISODES = 32
 COMMAND_RESAMPLE_S = (SETTLE_S + TIME_LIMIT_S + 1.0,) * 2
+
+
+def reference_critic_padding(env):
+    """Keep four legacy critic-only slots; never add these to the actor."""
+    return torch.zeros(env.num_envs, 4, device=env.device)
+
+
+def configure_reference_locomotion(cfg, knobs, rollout_steps=24):
+    """Port electricshaka/MicroDuck's Sprint recipe at da146b3944dc80d894f09781455d827925ab07a0.
+
+    Its Sprint settings match the Pollen reference: dense balance/velocity/gait
+    rewards, gentle-to-strong smoothing and standing practice. Keep our existing
+    compute budget and four critic padding slots; this is not an exact run
+    reproduction or a promise of a particular Arena score.
+    """
+    standing = {
+        r".*hip_yaw.*": 0.1, r".*hip_roll.*": 0.05,
+        r".*hip_pitch.*": 0.15, r".*knee.*": 0.15, r".*ankle.*": 0.1,
+    }
+    walking = {
+        r".*hip_yaw.*": 0.3, r".*hip_roll.*": 0.05,
+        r".*hip_pitch.*": 0.4, r".*knee.*": 0.4, r".*ankle.*": 0.25,
+    }
+    cfg.rewards["pose"].params.update(
+        std_standing=standing, std_walking=walking, std_running=walking,
+        walking_threshold=0.01,
+        asset_cfg=SceneEntityCfg(
+            "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",),
+        ),
+    )
+    cfg.rewards["pose"].weight = 1.0
+    cfg.rewards["upright"].weight = knobs["upright_reward"]
+    cfg.rewards["upright"].params.update(
+        std=math.sqrt(0.05),
+        asset_cfg=SceneEntityCfg("robot", body_names=("trunk_base",)),
+    )
+    cfg.rewards["track_linear_velocity"].weight = knobs["forward_reward"]
+    cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
+    cfg.rewards["track_angular_velocity"].weight = 2.0
+    cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
+    cfg.rewards["heading_hold"] = RewardTermCfg(
+        func=microduck_mdp.heading_hold_reward, weight=1.0,
+        params={"std": 0.4, "asset_cfg": SceneEntityCfg("robot")},
+    )
+    cfg.rewards["air_time"].weight = knobs["step_reward"]
+    cfg.rewards["air_time"].params.update(
+        command_threshold=0.01, threshold_min=0.125, threshold_max=0.300,
+    )
+    for name in ("foot_clearance", "foot_slip"):
+        cfg.rewards[name].params["asset_cfg"].site_names = ["left_foot", "right_foot"]
+    for name in ("foot_clearance", "foot_swing_height"):
+        cfg.rewards[name].params.update(command_threshold=0.01, target_height=0.02)
+    cfg.rewards["foot_slip"].weight = -0.1
+    cfg.rewards["foot_slip"].params["command_threshold"] = 0.01
+    cfg.rewards["body_ang_vel"].weight = -0.05
+    cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
+    cfg.rewards["angular_momentum"].weight = -0.02
+    cfg.rewards["action_rate_l2"].weight = -0.1
+    cfg.rewards.pop("soft_landing", None)
+    cfg.rewards["self_collisions"] = RewardTermCfg(
+        func=mdp.self_collision_cost, weight=-1.0,
+        params={"sensor_name": "self_collision"},
+    )
+    cfg.rewards["head_pose_tracking"] = RewardTermCfg(
+        func=microduck_mdp.head_pose_tracking, weight=2.0,
+        params={"command_name": "head_pose", "std": 0.5},
+    )
+    cfg.rewards["body_pose_tracking"] = RewardTermCfg(
+        func=microduck_mdp.body_pose_tracking_6d, weight=0.0,
+        params={
+            "command_name": "body_pose", "nominal_height": 0.095,
+            "xy_std": 0.05, "z_std": 0.02, "angle_std": math.radians(15),
+        },
+    )
+    cfg.rewards["head_pose_bias"] = RewardTermCfg(
+        func=microduck_mdp.head_pose_bias_penalty, weight=0.0,
+        params={"command_name": "head_pose", "tau_s": 1.0},
+    )
+    for term, reward_name, stages in (
+        ("action_rate_weight", "action_rate_l2", (
+            (0, -0.1), (500, -0.2), (750, -0.4),
+            (1000, -0.6), (1250, -0.8), (1500, -1.0),
+        )),
+        ("head_pose_bias_weight", "head_pose_bias", (
+            (0, 0.0), (600, 1.0), (1000, 2.0), (1500, 3.0),
+        )),
+    ):
+        cfg.curriculum[term] = CurriculumTermCfg(
+            func=microduck_mdp.reward_weight,
+            params={
+                "reward_name": reward_name,
+                "weight_stages": [
+                    {"step": iteration * rollout_steps, "weight": weight}
+                    for iteration, weight in stages
+                ],
+            },
+        )
+    cfg.curriculum["standing_envs"] = CurriculumTermCfg(
+        func=microduck_mdp.standing_envs_curriculum,
+        params={
+            "command_name": "twist",
+            "standing_stages": [
+                {"step": iteration * rollout_steps, "rel_standing_envs": fraction}
+                for iteration, fraction in (
+                    (0, 0.02), (500, 0.05), (750, 0.1),
+                    (1000, 0.15), (1500, 0.2), (2000, 0.25),
+                )
+            ],
+        },
+    )
+    cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)
+    cfg.episode_length_s = 20.0
+    cfg.is_finite_horizon = False
+    cfg.actions["joint_pos"].clip = None
+    cfg.observations["critic"].terms["race_state"] = ObservationTermCfg(
+        func=reference_critic_padding,
+    )
+    return cfg
 
 
 class RaceEpisode:

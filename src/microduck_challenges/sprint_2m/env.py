@@ -1,28 +1,24 @@
-"""The 2 m Sprint's training environment: a finite, gait-free timed race.
+"""Sprint locomotion recovery, following electricshaka/MicroDuck's reference.
 
-The race rewards are configured once by configure_race; no walker reward stack
-or posture/smoothing curriculum is applied.
-Discovery rewards reducing distance to the finish and legal completion, without
-clock pressure; falls and invalid states pay a one-time terminal failure cost.
-Once finishing is established, new episodes optimise race time
-with terminal-corrected guidance and a tiny head-posture tie-breaker. All 14 servo
-outputs remain free, with the original robot's physical limits unchanged.
-Weak actor mirror consistency encourages bilateral control without prescribing
-a gait; privileged critic observations are not used as mirrored PPO samples.
+Learn sustained balance and walking with dense reference rewards before tuning
+race speed. Training uses 20-second locomotion episodes, not the experimental
+distance/time mastery objective. Soft posture, heading and smoothing guidance
+is intentional; all 14 actuator outputs and physical robot limits are unchanged.
 
-The velocity template supplies the robot-independent infrastructure. Preserve
-its observation order, BAM servo model, sensor guards, and domain randomization.
-The distance/time mastery history is in-memory; restarting training starts
-discovery again rather than restoring that history from a PPO checkpoint.
+The actor remains Arena-compatible (61 observations). Four legacy critic slots
+are retained as zeros for checkpoint shape compatibility, not race state. Start
+this changed objective as a fresh run; matching shapes do not make old critic
+weights or normalizer statistics suitable for resuming it.
 """
 
 import math
 from copy import deepcopy
 
 NUM_STEPS_PER_ENV = 24
+POSE_COMMAND_RESAMPLE_S = (2.0, 5.0)
 
-# Soft bilateral policy consistency, not a fixed pose or alternating gait.
-ENABLE_SYMMETRY = True
+# Match the reference baseline before adding experimental actor regularizers.
+ENABLE_SYMMETRY = False
 
 # Domain randomization toggles
 ENABLE_COM_RANDOMIZATION = True
@@ -33,7 +29,7 @@ ENABLE_MASS_INERTIA_RANDOMIZATION = True  # Can enable once walking is stable
 ENABLE_JOINT_FRICTION_RANDOMIZATION = True  # Scales BAM's friction budget per-env via FrictionDRBamActuator.friction_scale
 ENABLE_JOINT_DAMPING_RANDOMIZATION = False
 ENABLE_ARMATURE_RANDOMIZATION = True  # Reflected rotor inertia (microban-style). DOES affect BAM (armature is set, not zeroed).
-ENABLE_VELOCITY_PUSHES = False  # Arena sprint has no external pushes
+ENABLE_VELOCITY_PUSHES = True  # Reference training uses mild recovery pushes
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True  # Simulates mounting errors
 ENABLE_ENCODER_BIAS = True  # Per-env joint encoder calibration offset (actor obs sees joint_pos + bias)
 ENABLE_BASE_ORIENTATION_RANDOMIZATION = False  # Randomize initial tilt to force reactive behavior
@@ -106,20 +102,18 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import SYMMETRY_CFG, PpoWithSymmetryCfg
 
-from .rewards import COMMAND_RESAMPLE_S, configure_race
+from .rewards import configure_reference_locomotion
 
 TRAINING_RECIPE = challenge.load(__file__).recipe
 
 
 def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
-    """Critic-only spawn-heading error, even when yaw guidance is disabled."""
+    """Critic-only error against the reference captured by heading_hold."""
     w, x, y, z = env.scene["robot"].data.root_link_quat_w.unbind(-1)
     yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    race = getattr(env, "_sprint_race", None)
-    if race is None:
-        reference = torch.where(env.episode_length_buf == 0, yaw, getattr(env, "_heading_ref", yaw))
-    else:
-        reference = torch.where(race.steps == 0, yaw, race.spawn_heading)
+    reference = torch.where(
+        env.episode_length_buf <= 1, yaw, getattr(env, "_heading_ref", yaw),
+    )
     error = yaw - reference
     return torch.atan2(torch.sin(error), torch.cos(error)).unsqueeze(-1)
 
@@ -149,7 +143,14 @@ def make_env_cfg(
         track_air_time=True,
     )
 
-    # Retained for privileged foot-height observations, not a stride-height target.
+    self_collision_cfg = ContactSensorCfg(
+        name="self_collision",
+        primary=ContactMatch(mode="subtree", pattern="trunk_base", entity="robot"),
+        secondary=ContactMatch(mode="subtree", pattern="trunk_base", entity="robot"),
+        fields=("found",), reduce="none", num_slots=1,
+    )
+
+    # Used by the reference's foot-height observations and clearance rewards.
     foot_height_scan_cfg = TerrainHeightSensorCfg(
         name="foot_height_scan",
         frame=tuple(ObjRef(type="site", name=s, entity="robot") for s in site_names),
@@ -174,7 +175,7 @@ def make_env_cfg(
 
     # Robot setup
     cfg.scene.entities = {"robot": MICRODUCK_WALK_ROBOT_CFG}
-    cfg.scene.sensors = (feet_ground_cfg, foot_height_scan_cfg)
+    cfg.scene.sensors = (feet_ground_cfg, self_collision_cfg, foot_height_scan_cfg)
     cfg.viewer.body_name = "trunk_base"
 
     # Action configuration
@@ -363,7 +364,7 @@ def make_env_cfg(
         func=mdp.base_lin_vel,
         scale=1.0,
     )
-    # Privileged diagnostic only; yaw guidance is disabled in the race recipe.
+    # Privileged only: the actor is never told its heading.
     cfg.observations["critic"].terms["heading_error"] = ObservationTermCfg(func=heading_error)
 
     # Determine gravity/accelerometer term name based on flag
@@ -463,7 +464,7 @@ def make_env_cfg(
     # standup/ground_pick envs mutate commands["twist"] in place, zeroing ranges)
     command: UniformVelocityCommandCfg = deepcopy(cfg.commands["twist"])
     cfg.commands["twist"] = command
-    command.rel_standing_envs = 0.0  # every episode is a forward race, not idle practice
+    command.rel_standing_envs = 0.02  # Reference balance practice, ramped by curriculum
     command.rel_heading_envs = 0.0
     # The ranges are the Arena event's own (arena/events/sprint-2m.toml):
     # straight ahead, the event's sweep of commanded speeds, never sideways or
@@ -475,10 +476,9 @@ def make_env_cfg(
     command.viz.z_offset = 0.5
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
 
-    # Keep command slots and small sampling ranges for interface compatibility.
-    # These are observations, not actuator restrictions or head-tracking targets.
+    # Preserve the reference's command slots and soft head-tracking targets.
     cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(
-        resampling_time_range=COMMAND_RESAMPLE_S,
+        resampling_time_range=POSE_COMMAND_RESAMPLE_S,
         ranges=(
             (-0.05, 0.05),    # neck_pitch
             (-0.05, 0.05),    # head_pitch
@@ -486,9 +486,9 @@ def make_env_cfg(
             (-0.015, 0.015),  # head_roll (tighter — much smaller mechanical range)
         ),
     )
-    # Body command slot: [x, y, z, roll, pitch, yaw], without a tracking reward.
+    # Body command slot: [x, y, z, roll, pitch, yaw]; tracking weight remains zero.
     cfg.commands["body_pose"] = microduck_mdp.UniformPoseCommandCfg(
-        resampling_time_range=COMMAND_RESAMPLE_S,
+        resampling_time_range=POSE_COMMAND_RESAMPLE_S,
         ranges=(
             (-0.005, 0.005),  # x (m)
             (-0.005, 0.005),  # y (m)
@@ -556,8 +556,8 @@ def make_env_cfg(
     del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
-    # The sole reward/termination recipe: distance discovery, then timed racing.
-    return configure_race(cfg, knobs)
+    # Keep the reference's dense locomotion objective; judge speed with the Arena.
+    return configure_reference_locomotion(cfg, knobs, NUM_STEPS_PER_ENV)
 
 
 RL_CFG = RslRlOnPolicyRunnerCfg(
@@ -568,9 +568,8 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         obs_normalization=True,
         distribution_cfg={
             "class_name": "GaussianDistribution",
-            # Broader joint-target exploration for neck/head and both legs.
-            # This is sampling noise, not extra torque or a larger physical range.
-            "init_std": 1.25,
+            # Reference exploration scale; no change to physical action range.
+            "init_std": 1.0,
             "std_type": "scalar",  # independent learned std for each of 14 outputs
         },
     ),
@@ -583,28 +582,16 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.02,  # stronger exploration pressure; no reward for flailing
+        entropy_coef=0.01,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,
         schedule="adaptive",
-        gamma=1.0,  # finite race: optimise seconds, not discounted survival
-        lam=0.98,  # longer credit assignment; rollout length and run budget unchanged
+        gamma=0.99,
+        lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
-        symmetry_cfg=(
-            {
-                **SYMMETRY_CFG,
-                # The upstream mirror function repeats unmirrored critic state.
-                # Use it only for actor consistency, never PPO data augmentation.
-                "use_data_augmentation": False,
-                "use_mirror_loss": True,
-                # Weaker than the upstream/SteveTarter default of 0.5 so novel
-                # asymmetric states can still produce distinct joint targets.
-                "mirror_loss_coeff": 0.1,
-            }
-            if ENABLE_SYMMETRY else None
-        ),
+        symmetry_cfg=deepcopy(SYMMETRY_CFG) if ENABLE_SYMMETRY else None,
     ),
     wandb_project="mjlab_microduck",
     experiment_name="sprint_2m",  # logs/rsl_rl/sprint_2m/

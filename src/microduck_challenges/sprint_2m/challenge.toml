@@ -4,25 +4,25 @@ event = "sprint-2m"
 task  = "Mjlab-Sprint2m-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # distance-first, then race-time; local RTX 3060 recipe
+[recipe]                  # electricshaka reference strategy; existing local budget
 num_envs       = 2048
 max_iterations = 3000
 seed           = 2
 
 [params.forward_reward]
-label = "Reach the finish safely (distance first, then speed)"
-value = 5.0
+label = "Follow the speed order"
+value = 2.0
 min   = 0.5
 max   = 5.0
 
 [params.upright_reward]
-label = "Upright guidance (zero net race reward)"
-value = 0.1
-min   = 0.0
+label = "Stay upright"
+value = 2.0
+min   = 0.5
 max   = 5.0
 
 [params.step_reward]
-label = "Free-flight airtime guidance (zero net race reward)"
-value = 1.0
+label = "Lift your feet"
+value = 3.0
 min   = 0.0
 max   = 6.0
