@@ -37,6 +37,7 @@ Task design (the roller recipe):
 """
 
 import math
+import re
 from copy import deepcopy
 
 # Symmetry — OFF: SYMMETRY_CFG's obs permutation is hardcoded for the old 51D
@@ -104,9 +105,12 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROLLERS_ROB
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
+from . import rewards as roller_rewards
+
 
 def make_env_cfg(
     play: bool = False,
+    stage: str | None = None,
 ) -> ManagerBasedRlEnvCfg:
     """The roller sprint's training environment."""
 
@@ -630,10 +634,14 @@ def make_env_cfg(
             },
         )
 
+    settings = roller_rewards.training_settings(stage)
+    cfg.scene.num_envs = settings["num_envs"]
+    if settings["stage"] == "warm_start":
+        return roller_rewards.configure_warm_env(cfg, settings, play=play)
     return cfg
 
 
-RL_CFG = RslRlOnPolicyRunnerCfg(
+_BASE_RL_CFG = RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
         hidden_dims=(512, 256, 128),
         activation="elu",
@@ -671,3 +679,23 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     num_steps_per_env=24,
     max_iterations=50_000,
 )
+
+
+def make_rl_cfg(stage: str | None = None):
+    cfg = deepcopy(_BASE_RL_CFG)
+    settings = roller_rewards.training_settings(stage)
+    cfg.seed = settings["seed"]
+    cfg.max_iterations = settings["max_iterations"]
+    if settings["stage"] == "warm_start":
+        selected = roller_rewards.select_source(make_env_cfg(stage="baseline"), cfg, settings)
+        cfg.resume = True
+        cfg.load_run = "^" + re.escape(selected["run"].name) + "$"
+        cfg.load_checkpoint = f"^model_{settings['source_checkpoint']}\\.pt$"
+        cfg.algorithm.class_name = "microduck_challenges.roller_sprint_2m.rewards:RollerWarmStartPPO"
+        cfg.algorithm.learning_rate = 1e-4
+        cfg.algorithm.schedule = "fixed"
+        cfg.save_interval = 25
+    return cfg
+
+
+RL_CFG = make_rl_cfg()

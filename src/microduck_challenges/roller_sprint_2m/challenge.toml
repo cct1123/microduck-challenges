@@ -5,10 +5,20 @@ event = "roller-sprint-2m"
 task  = "Mjlab-RollerSprint2m-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # RTX 3060 candidate; judge by Arena finishes/time
+[recipe]                  # Conservative refinement; no run is launched by this file
 num_envs       = 2048
-max_iterations = 3000
+max_iterations = 300
 seed           = 2
+
+[training]
+stage = "warm_start"       # Normal CLI/Workshop launch loads the pinned Roller source
+source_run = "2026-10-23_03-57-00_run-1023-0356"
+source_checkpoint = 2750
+source_sha256 = "aa08986e4f1d5afcd48a733bb7c6e1a272f85b8e26c216164932596859298a8a"
+hold_iterations = 25
+ramp_iterations = 100
+progress_weight = 1.0
+speed_cap = 1.5
 
 [params.speed_reward]
 label = "Wheel speed reward"
