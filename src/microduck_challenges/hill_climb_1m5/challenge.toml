@@ -9,6 +9,38 @@ num_envs       = 4096
 max_iterations = 3000
 seed           = 1
 
+# Bootstrap keeps the original beginner curriculum and optimization recipe.
+# Refinement is a separate explicit launch, never an automatic phase switch.
+[training]
+stage = "bootstrap"
+reward_profile = "A0"
+bootstrap_wall_minutes = 180
+
+[training.phases.explore]
+max_iterations = 500
+num_envs = 2048
+save_interval = 50
+learning_rate = 0.00005
+entropy_coef = 0.01
+clip_param = 0.2
+exploration_std_scale = 1.0
+max_wall_minutes = 40
+
+[training.phases.exploit]
+max_iterations = 500
+num_envs = 2048
+save_interval = 50
+learning_rate = 0.00001
+entropy_coef = 0.001
+clip_param = 0.1
+exploration_std_scale = 0.5
+max_wall_minutes = 40
+
+[training.gate]
+neighbor_checkpoints = 3
+heldout_first_seed = 6
+heldout_seed_count = 20
+
 [params.forward_reward]
 label = "Follow the speed order"
 value = 2.0

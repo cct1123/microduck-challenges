@@ -26,7 +26,11 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
 """
 
 import math
+import os
+import tomllib
 from copy import deepcopy
+from pathlib import Path
+from dataclasses import asdict
 
 NUM_STEPS_PER_ENV = 24
 
@@ -129,6 +133,12 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
+from .learning import HillPpoCfg, phase_settings, refinement_recipe, validate_source
+
+TRAINING = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
+RECIPE = challenge.load(__file__).recipe
+TRAINING_STAGE = os.environ.get("MICRODUCK_HILL_STAGE", TRAINING["stage"])
+
 
 def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
     """How far the trunk has turned from the heading heading_hold holds (rad, wrapped).
@@ -197,8 +207,22 @@ def _soften_terrain_contacts(spec: _mujoco.MjSpec) -> None:
 
 def make_env_cfg(
     play: bool = False,
+    *, stage: str | None = None, reward_profile: str | None = None, source=None,
 ) -> ManagerBasedRlEnvCfg:
     """The hill climb's training environment."""
+
+    active_stage = TRAINING_STAGE if stage is None else stage
+    profile = reward_profile if reward_profile is not None else (
+        os.environ.get("MICRODUCK_HILL_REWARD_PROFILE", TRAINING["reward_profile"])
+        if stage is None else "A0")
+    if active_stage not in ("bootstrap", "refine"):
+        raise ValueError(f"Unknown Hill training stage: {active_stage}")
+    if active_stage == "bootstrap" and profile != "A0":
+        raise ValueError("Hill bootstrap requires A0; reward experiments need strict refinement")
+    if active_stage == "refine" and source is None:
+        source = os.environ.get("MICRODUCK_HILL_SOURCE")
+        if source is None:
+            raise ValueError("Hill refinement requires an explicit hill source")
 
     # The knobs a novice tunes, from challenge.toml beside this file.
     knobs = challenge.params(__file__)
@@ -901,10 +925,17 @@ def make_env_cfg(
         },
     )
 
+    cfg.scene.num_envs = int(RECIPE["num_envs"])
+    if active_stage == "refine":
+        selected = validate_source(source, make_env_cfg(stage="bootstrap"), BASE_RL_CFG)
+        cfg = refinement_recipe(cfg, selected["curriculum_clock"], profile)
+        phase = os.environ.get("MICRODUCK_HILL_PHASE", "explore")
+        cfg.scene.num_envs = phase_settings(TRAINING, phase)["num_envs"]
     return cfg
 
 
 RL_CFG = RslRlOnPolicyRunnerCfg(
+    seed=int(RECIPE["seed"]),
     actor=RslRlModelCfg(
         hidden_dims=(512, 256, 128),
         activation="elu",
@@ -920,7 +951,8 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         activation="elu",
         obs_normalization=True,
     ),
-    algorithm=PpoWithSymmetryCfg(
+    algorithm=HillPpoCfg(
+        class_name="microduck_challenges.hill_climb_1m5.learning:HillPPO",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
@@ -940,5 +972,37 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     run_name="hill_climb_1m5",
     save_interval=250,
     num_steps_per_env=24,
-    max_iterations=50_000,
+    max_iterations=int(RECIPE["max_iterations"]),
 )
+
+# The registered identity/runner stays unchanged. No archive lookup on a clean import.
+BASE_RL_CFG = deepcopy(RL_CFG)
+if TRAINING_STAGE == "refine":
+    import re
+    from .evidence import require_promotion, read_report
+
+    _source = os.environ.get("MICRODUCK_HILL_SOURCE")
+    _selected = validate_source(_source, make_env_cfg(stage="bootstrap"), BASE_RL_CFG)
+    _phase = os.environ.get("MICRODUCK_HILL_PHASE", "explore")
+    _controls = phase_settings(TRAINING, _phase)
+    _profile = os.environ.get("MICRODUCK_HILL_REWARD_PROFILE", TRAINING["reward_profile"])
+    if os.environ.get("MICRODUCK_WARM_START", "") not in ("", "0"):
+        raise ValueError("MICRODUCK_WARM_START must not reset Hill curricula")
+    if _phase == "exploit":
+        _approval = os.environ.get("MICRODUCK_HILL_PROMOTION")
+        if not _approval:
+            raise ValueError("Exploitation requires an approved promotion report")
+        _gate = {**TRAINING["gate"], "command_vx": read_report(_approval)["gate"]["command_vx"]}
+        require_promotion(_approval, _selected["path"], _gate)
+        if _profile != _selected["profile"]:
+            raise ValueError("Exploitation must preserve the approved reward profile")
+    RL_CFG.resume = True
+    RL_CFG.load_run = "^" + re.escape(_selected["path"].parent.name) + "$"
+    RL_CFG.load_checkpoint = "^" + re.escape(_selected["path"].name) + "$"
+    RL_CFG.max_iterations = _controls["max_iterations"]
+    RL_CFG.save_interval = _controls["save_interval"]
+    RL_CFG.algorithm = HillPpoCfg(**{**asdict(BASE_RL_CFG.algorithm),
+        "stage": "refine", "reward_profile": _profile, "source_clock": _selected["clock"],
+        "curriculum_clock": _selected["curriculum_clock"],
+        "schedule": "fixed", **{k: _controls[k] for k in
+            ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale")}})
