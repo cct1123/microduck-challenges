@@ -10,14 +10,14 @@ max_iterations = 500
 seed           = 1
 
 # Bootstrap keeps the original beginner curriculum and optimization recipe.
-# H1 exploration is selected explicitly below, never an automatic phase switch.
+# Stability exploration is explicit; elapsed time never authorizes speed pressure.
 [training]
 stage = "refine"
-reward_profile = "H1"
+reward_profile = "S0"
 bootstrap_wall_minutes = 180
 
 # Explicit user exception: this 3/5 policy may seed exploration ONLY.
-# Its source recipe is reconstructed independently, before any H1 override.
+# Its source recipe is reconstructed independently, before the S0 guard is added.
 [training.refine]
 source = "logs/rsl_rl/hill_climb_1m5/2026-10-24_23-10-03_run-1024-2309/model_1000.pt"
 sha256 = "799ed0b452a1a484b4f700362248779fe127a1ba821a2c545728cdf9c9e814b9"
@@ -41,7 +41,7 @@ learning_rate = 0.00005
 entropy_coef = 0.01
 clip_param = 0.2
 exploration_std_scale = 1.0
-max_wall_minutes = 40
+max_wall_minutes = 50
 
 [training.phases.exploit]
 max_iterations = 500

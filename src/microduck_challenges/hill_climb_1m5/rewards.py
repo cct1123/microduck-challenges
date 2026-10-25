@@ -1,4 +1,4 @@
-"""H1 hypotheses on generated Hill terrain, not fixed-slope race progress.
+"""Hill profile rewards on generated terrain, not fixed-slope race progress.
 
 Forward means horizontal world velocity projected onto the spawn heading.
 Upright remains the optimum; only nose-down pitch tolerance is relaxed while
@@ -46,6 +46,14 @@ def horizontal_forward_speed(env, origin_step, hold_steps, ramp_steps, vel_ref=1
     speed, _, valid = _motion(env)
     value = _fraction(env, origin_step, hold_steps, ramp_steps) * torch.tanh(speed / vel_ref)
     return torch.where(valid, value, 0.)
+
+
+def stability_forward_speed(env, vel_ref=1.):
+    """P1 only: signed horizontal spawn-heading speed, with NO clock ramp."""
+    if not math.isfinite(vel_ref) or vel_ref <= 0:
+        raise ValueError("vel_ref must be finite and positive")
+    speed, _, valid = _motion(env)
+    return torch.where(valid, torch.tanh(speed / vel_ref), 0.)
 
 
 def drive_upright(env, std, forward_variance, motion_speed, origin_step, hold_steps, ramp_steps):
@@ -96,4 +104,20 @@ def configure_h1(cfg, origin_step):
     upright.params = {**schedule, "std": upright.params["std"],
                       **{k: H1[k] for k in ("forward_variance", "motion_speed")}}
     cfg.terminations["arena_held_fall"] = TerminationTermCfg(func=ArenaTiltGuard, time_out=False)
+    return cfg
+
+
+def configure_stability(cfg, profile):
+    """S0 preserves A0; P1 differs ONLY by a weight-1 signed speed term.
+
+    Both retain the original upright formula/variance and hard backstop, and
+    both add the same independent Arena-style held-fall termination.
+    """
+    from mjlab.managers import RewardTermCfg, TerminationTermCfg
+    if profile not in ("S0", "P1"):
+        raise ValueError("Unknown Hill stability profile")
+    cfg.terminations["arena_held_fall"] = TerminationTermCfg(func=ArenaTiltGuard, time_out=False)
+    if profile == "P1":
+        cfg.rewards["horizontal_forward_speed"] = RewardTermCfg(
+            func=stability_forward_speed, weight=1.0, params={"vel_ref": 1.0})
     return cfg

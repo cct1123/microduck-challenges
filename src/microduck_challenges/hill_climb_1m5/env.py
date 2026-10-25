@@ -135,7 +135,8 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 from .learning import (HillPpoCfg, mark_actor_only_inference, phase_settings, refinement_recipe,
-                       validate_source, APPROVED_PARTIAL, partial_source_pins, read_config)
+                       validate_source, APPROVED_PARTIAL, partial_source_pins, read_config,
+                       STABILITY_PROFILES, stability_parameters, stability_gate_binding)
 
 TRAINING = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
 RECIPE = challenge.load(__file__).recipe
@@ -154,7 +155,7 @@ def selected_training_source(source=None, *, phase=None):
         partial_source_pins(exception, source, phase)
         knobs = exception["base_knobs"]
     elif source is not None:
-        # H1 descendants carry the original construction inputs, not today's knobs.
+        # Refinement descendants carry construction inputs, not today's Workshop knobs.
         saved = read_config(Path(source).parent / "params/agent.yaml") if Path(source).is_file() else {}
         knobs = saved.get("algorithm", {}).get("base_knobs")
     selected = validate_source(source, make_env_cfg(stage="bootstrap", knobs=knobs), BASE_RL_CFG,
@@ -167,18 +168,34 @@ def selected_training_source(source=None, *, phase=None):
     selected["source_identity"] = {"path": str(selected["path"]), "sha256": digest(selected["path"]),
         "artifacts": {str(p): digest(p) for p in files}, "partial_exception": selected["partial_exception"]}
     selected["reward_origin"] = (selected["source_agent"]["algorithm"].get("reward_origin", selected["clock"])
-                                  if selected["profile"] == "H1" else selected["clock"])
+                                  if selected["profile"] in STABILITY_PROFILES | {"H1"} else selected["clock"])
     return selected
 
 
-def refinement_algorithm(selected, phase, profile):
+def selected_stability_gate(selected, gate_path=None, gate_sha256=None):
+    """Resolve explicit launch evidence; the loader never uses these ambient defaults."""
+    path = os.environ.get("MICRODUCK_HILL_STABILITY_GATE") if gate_path is None else gate_path
+    sha256 = os.environ.get("MICRODUCK_HILL_STABILITY_GATE_SHA256") if gate_sha256 is None else gate_sha256
+    return stability_gate_binding(selected, path, sha256)
+
+
+def refinement_algorithm(selected, phase, profile, *, stability_gate=None, stability_gate_sha256=None):
     from .rewards import H1
     controls = phase_settings(TRAINING, phase)
+    parameters = H1 if profile == "H1" else None
+    gate_path, gate_sha256 = None, None
+    if profile in STABILITY_PROFILES:
+        canonical = refinement_recipe(make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]),
+                                       selected["curriculum_clock"], profile)
+        parameters = stability_parameters(canonical)
+    if profile == "P1":
+        gate_path, gate_sha256 = selected_stability_gate(selected, stability_gate, stability_gate_sha256)
     return HillPpoCfg(**{**asdict(BASE_RL_CFG.algorithm),
         "stage": "refine", "reward_profile": profile, "source_clock": selected["clock"],
         "curriculum_clock": selected["curriculum_clock"], "learning_phase": phase,
         "source_identity": selected["source_identity"], "base_knobs": selected["base_knobs"],
-        "reward_origin": selected["reward_origin"], "reward_parameters": H1 if profile == "H1" else None,
+        "reward_origin": selected["reward_origin"], "reward_parameters": parameters,
+        "stability_gate": gate_path, "stability_gate_sha256": gate_sha256,
         "schedule": "fixed", **{k: controls[k] for k in
             ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale")}})
 
@@ -263,6 +280,8 @@ def make_env_cfg(
     if active_stage == "bootstrap" and profile != "A0":
         raise ValueError("Hill bootstrap requires A0; reward experiments need strict refinement")
     selected = selected_training_source(source) if active_stage == "refine" else None
+    if profile == "P1" and selected is not None and not play:
+        selected_stability_gate(selected)
 
     # The knobs a novice tunes, from challenge.toml beside this file.
     knobs = selected["base_knobs"] if selected else (challenge.params(__file__) if knobs is None else knobs)

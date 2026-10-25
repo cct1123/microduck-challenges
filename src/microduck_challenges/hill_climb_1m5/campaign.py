@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any, cast
 
 from . import env as hill_env
@@ -227,9 +227,19 @@ def make_plan(stage=None, phase="explore", source=None, promotion_path=None,
          source.parent / "provenance.json", selected["result_path"])}
     if promotion_path:
         artifacts[str(Path(promotion_path).resolve())] = digest(promotion_path)
+    algorithm = asdict(hill_env.refinement_algorithm(selected, phase, reward_profile)) if selected else asdict(hill_env.BASE_RL_CFG.algorithm)
+    if reward_profile == "P1":
+        # Copy the canonical binding already verified by refinement_algorithm;
+        # the child must not depend on the caller's temporary ambient settings.
+        gate_path, gate_hash = algorithm["stability_gate"], algorithm["stability_gate_sha256"]
+        if digest(gate_path) != gate_hash:
+            raise ValueError("Stability gate changed during plan construction")
+        environment.update(MICRODUCK_HILL_STABILITY_GATE=gate_path,
+                           MICRODUCK_HILL_STABILITY_GATE_SHA256=gate_hash)
+        artifacts[gate_path] = gate_hash
     return {"stage": stage, "phase": phase, "reward_profile": reward_profile,
             "source_identity": selected["source_identity"] if selected else None,
-            "target_algorithm": asdict(hill_env.refinement_algorithm(selected, phase, reward_profile)) if selected else asdict(hill_env.BASE_RL_CFG.algorithm),
+            "target_algorithm": algorithm,
             "target_reward_parameters": {n: config_data(target)["rewards"][n]["params"] for n in ("upright", "horizontal_forward_speed") if n in target.rewards},
             "reward_overrides": overrides, "source": str(source) if source else None,
             "source_clock": selected["clock"] if selected else 0,
@@ -244,10 +254,9 @@ def make_plan(stage=None, phase="explore", source=None, promotion_path=None,
 
 
 def write_json(path, data):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
+    """Durable atomic replace: a successful journal write survives a crash."""
+    from .overnight import durable_json
+    durable_json(path, data)
 
 
 def _saved_actor(checkpoint):
@@ -510,7 +519,7 @@ def _termination_requests():
             signal.signal(signum, handler)
 
 
-def _stop_owned_process(process):
+def _stop_owned_process(process, deadline=None):
     """Terminate and reap this launch's own process group, including error paths."""
     if process.poll() is not None:
         return
@@ -520,7 +529,7 @@ def _stop_owned_process(process):
         process.wait()
         return
     try:
-        process.wait(timeout=30)
+        process.wait(timeout=30 if deadline is None else max(0, min(5, deadline - time())))
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -529,7 +538,16 @@ def _stop_owned_process(process):
         process.wait()
 
 
-def run_bounded(plan, output):
+def run_permitted_units(output, *, global_deadline):
+    """The supported no-smoke preflight: full tracked units with runtime guards."""
+    from .overnight import run_permitted_units as run_units
+    return run_units(output, global_deadline=global_deadline)
+
+
+def run_bounded(plan, output, *, no_smoke=False, global_deadline=None, monitor=None):
+    if no_smoke and (type(global_deadline) not in (int, float)
+                     or not math.isfinite(global_deadline) or global_deadline <= time()):
+        raise ValueError("No-smoke launch requires a future absolute global deadline")
     if active_trainers():
         raise ValueError("Another local trainer is active; refusing a concurrent run")
     lock_path = LOG_ROOT.parent.parent / ".hill-strategy.lock"
@@ -539,30 +557,45 @@ def run_bounded(plan, output):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Another Hill strategy trainer owns the launch lock") from error
-        return _run_bounded(plan, output)
+        return _run_bounded(plan, output, no_smoke=no_smoke,
+                            global_deadline=global_deadline, monitor=monitor)
 
 
-def _run_bounded(plan, output):
+def _run_bounded(plan, output, *, no_smoke=False, global_deadline=None, monitor=None):
     if plan["requires_promotion"]:
         require_promotion(plan["environment"].get("MICRODUCK_HILL_PROMOTION"),
                           plan["source"], {**hill_env.TRAINING["gate"], "command_vx": read_report(plan["environment"]["MICRODUCK_HILL_PROMOTION"])["gate"]["command_vx"]})
     minutes = plan["max_wall_minutes"]
     if type(minutes) not in (int, float) or not math.isfinite(minutes) or minutes <= 0:
         raise ValueError("Wall-time budget must be finite and positive")
+    if no_smoke:
+        if (type(global_deadline) not in (int, float) or not math.isfinite(global_deadline)
+                or global_deadline <= time()):
+            raise ValueError("No-smoke preflight requires a future global deadline")
+        if minutes > 50:
+            raise ValueError("No-smoke screen exceeds the 50 minute wall cap")
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    with (output / "tests.log").open("w") as stream:
-        subprocess.run([sys.executable, "-m", "pytest", "-q"],
-                        env={**os.environ, "MICRODUCK_SPRINT_STAGE": "baseline", "MICRODUCK_HILL_STAGE": "bootstrap"}, stdout=stream,
-                        stderr=subprocess.STDOUT, check=True)
-    smoke(plan["stage"], plan["phase"], plan["source"], output / "smoke", plan["reward_profile"], plan["seed"])
+    if no_smoke:
+        unit_report = run_permitted_units(output, global_deadline=global_deadline)
+    else:
+        with (output / "tests.log").open("w") as stream:
+            subprocess.run([sys.executable, "-m", "pytest", "-q"],
+                            env={**os.environ, "MICRODUCK_SPRINT_STAGE": "baseline", "MICRODUCK_HILL_STAGE": "bootstrap"}, stdout=stream,
+                            stderr=subprocess.STDOUT, check=True)
+        smoke(plan["stage"], plan["phase"], plan["source"], output / "smoke", plan["reward_profile"], plan["seed"])
+        unit_report = None
+    if global_deadline is not None and time() >= global_deadline:
+        raise ValueError("Global deadline expired during preflight")
     if active_trainers():
         raise ValueError("Another trainer started during preflight; refusing to launch")
     if (any(digest(p) != value for p, value in plan.get("source_config_files", {}).items())
             or any(digest(p) != value for p, value in plan["source_files"].items())):
         raise ValueError("Source checkpoint or scripts changed during preflight")
     identity = plan_digest(plan)
-    journal = {"plan": plan, "plan_digest": identity, "state": "reserved", "pid": None}
+    journal = {"plan": plan, "plan_digest": identity, "state": "reserved", "pid": None,
+               "global_deadline_epoch": global_deadline,
+               "preflight": {"no_smoke": no_smoke, "unit_report": unit_report}}
     write_json(output / "run.json", journal)
     with (output / "training.log").open("w") as stream, _termination_requests() as stop:
         environment = {**os.environ, **plan["environment"],
@@ -571,15 +604,34 @@ def _run_bounded(plan, output):
         environment.pop("MICRODUCK_WARM_START", None)
         process = None
         try:
-            process = subprocess.Popen(plan["command"], env=environment,
+            launch_command = plan["command"]
+            trainer_deadline = None
+            if no_smoke:
+                trainer_deadline = min(time() + minutes * 60, global_deadline - 5)
+                if trainer_deadline <= time():
+                    raise ValueError("Training deadline expired before child launch")
+                launch_command = [sys.executable, "-m", "microduck_challenges.hill_climb_1m5.overnight",
+                    "trainer-worker", "--request", str(output / "run.json"),
+                    "--request-sha256", identity, "--owner-pid", str(os.getpid()),
+                    "--deadline", str(trainer_deadline), "--execute"]
+                journal["trainer_deadline_epoch"] = trainer_deadline
+                write_json(output / "run.json", journal)
+            process = subprocess.Popen(launch_command, env=environment,
                                        stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
             journal.update(state="running", pid=process.pid)
             write_json(output / "run.json", journal)
             deadline = monotonic() + minutes * 60
+            if global_deadline is not None:
+                deadline = min(deadline, monotonic() + max(0, global_deadline - time() - 5))
             while True:
                 if stop[0] is not None:
                     journal.update(state="interrupted", signal=stop[0])
                     break
+                if monitor is not None:
+                    reason = monitor(process, journal)
+                    if reason:
+                        journal.update(state="branch_rollback", stop_reason=str(reason))
+                        break
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     journal["state"] = "wall_budget_exhausted"
@@ -592,10 +644,15 @@ def _run_bounded(plan, output):
                 break
         except KeyboardInterrupt:
             journal["state"] = "interrupted"
+        except BaseException as error:
+            journal.update(state="failed", error=f"{type(error).__name__}: {error}")
+            raise
         finally:
             if process is not None:
-                _stop_owned_process(process)
+                _stop_owned_process(process, global_deadline)
                 journal["exit_code"] = process.returncode
+            if journal["state"] == "failed":
+                write_json(output / "run.json", journal)
     journal["source_files_unchanged"] = all(digest(p) == value for p, value in plan["source_files"].items())
     journal["source_artifacts_unchanged"] = all(digest(p) == value for p, value in plan.get("source_config_files", {}).items())
     if not journal["source_files_unchanged"] or not journal["source_artifacts_unchanged"]:

@@ -11,6 +11,74 @@ import yaml
 from microduck_challenges.hill_climb_1m5 import env
 
 
+def test_s0_is_the_source_age_a0_recipe_with_same_independent_fall_guard_as_p1():
+    from microduck_challenges.hill_climb_1m5 import learning, rewards
+    knobs = learning.APPROVED_PARTIAL["base_knobs"]
+    baseline = env.make_env_cfg(stage="bootstrap", knobs=knobs)
+    control = learning.refinement_recipe(deepcopy(baseline), 24024, "A0")
+    stable = learning.refinement_recipe(deepcopy(baseline), 24024, "S0")
+    faster = learning.refinement_recipe(deepcopy(baseline), 24024, "P1")
+    assert stable.rewards["upright"].params["std"] ** 2 == pytest.approx(.05)
+    assert stable.rewards["upright"].weight == 2.
+    assert stable.rewards["track_linear_velocity"].weight == 3.95619419642857
+    assert stable.rewards["air_time"].weight == 6.
+    assert stable.rewards["heading_hold"].weight == 1.
+    assert stable.rewards["head_pose_bias"].weight == 2.
+    assert stable.rewards["action_rate_l2"].weight == -.6
+    assert "horizontal_forward_speed" not in stable.rewards
+    assert stable.terminations["arena_held_fall"].func is rewards.ArenaTiltGuard
+    before, after = learning.config_data(control), learning.config_data(stable)
+    after["terminations"].pop("arena_held_fall")
+    assert before == after  # No lean, heading, head, terrain, command or curriculum change.
+    before, after = learning.config_data(stable), learning.config_data(faster)
+    speed = after["rewards"].pop("horizontal_forward_speed")
+    assert speed["weight"] == 1. and speed["params"] == {"vel_ref": 1.}
+    assert before == after  # P1 is exactly one added reward; SAME fall guard.
+    assert env.TRAINING["stage"] == "refine" and env.TRAINING["reward_profile"] == "S0"
+    assert learning.phase_settings(env.TRAINING, "explore")["max_wall_minutes"] == 50
+
+
+def test_p1_signed_horizontal_speed_has_no_timer_or_command_dependency_and_fails_safe():
+    from microduck_challenges.hill_climb_1m5 import learning, rewards
+    cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24, "P1")
+    speed = cfg.rewards["horizontal_forward_speed"]
+    raw = _motion_fixture(yaw=90.)
+    raw._heading_ref[:] = torch.pi / 2
+    data = raw.scene["robot"].data
+    data.root_link_lin_vel_w[:] = torch.tensor([[0., .1, 4.]])
+    expected = torch.tanh(torch.tensor([.1]))
+    for clock in (0, 24, 120000):
+        raw.common_step_counter = clock
+        torch.testing.assert_close(speed.func(raw, **speed.params), expected)
+    data.root_link_lin_vel_w[:, 1] = -.1
+    torch.testing.assert_close(speed.func(raw, **speed.params), -expected)
+    data.root_link_lin_vel_w[:, 1] = 0
+    assert speed.func(raw, **speed.params).item() == 0  # Vertical velocity pays nothing.
+    raw._heading_ref[:] = 0
+    raw.episode_length_buf[:] = 0
+    data.root_link_lin_vel_w[:, 1] = .1
+    torch.testing.assert_close(speed.func(raw, **speed.params), expected)
+    raw = _motion_fixture(pitch=61.)
+    assert speed.func(raw, **speed.params).item() == 0
+    guard = rewards.ArenaTiltGuard(None, raw)
+    for _ in range(14):
+        assert not guard(raw).item()
+    assert guard(raw).item()
+    # No payout after the independent guard has failed, even if trunk comes upright.
+    raw.scene["robot"].data.root_link_quat_w[:] = torch.tensor([[1., 0., 0., 0.]])
+    assert speed.func(raw, **speed.params).item() == 0
+    guard.reset(torch.tensor([0]))
+    assert speed.func(raw, **speed.params).item() > 0
+    for key in ("root_link_quat_w", "root_link_lin_vel_w"):
+        saved = getattr(raw.scene["robot"].data, key).clone()
+        getattr(raw.scene["robot"].data, key)[:, 0] = float("nan")
+        assert speed.func(raw, **speed.params).item() == 0
+        setattr(raw.scene["robot"].data, key, saved)
+    for invalid in (0., -1., float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="vel_ref"):
+            speed.func(raw, vel_ref=invalid)
+
+
 def test_h1_adds_ramped_signed_speed_and_only_forward_motion_lean_tolerance():
     from microduck_challenges.hill_climb_1m5 import learning
     cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24024, "H1")
@@ -69,7 +137,8 @@ def test_approved_partial_source_is_exact_pinned_exploration_only(monkeypatch):
         env.selected_training_source(source, phase="explore")
 
 
-def test_plain_workshop_tyro_defaults_restore_the_real_h1_source_without_simulation():
+@pytest.mark.parametrize("explicit_profile", [None, "H1"])
+def test_plain_workshop_tyro_defaults_and_explicit_h1_restore_real_source_without_simulation(explicit_profile):
     import json
     import os
     import subprocess
@@ -78,7 +147,7 @@ def test_plain_workshop_tyro_defaults_restore_the_real_h1_source_without_simulat
     if not source.exists():
         pytest.skip("Real source archive is local, not a portable fixture")
     code = '''
-import json, torch, tyro, mjlab
+import json, os, torch, tyro, mjlab
 from dataclasses import asdict
 from types import SimpleNamespace
 from tensordict import TensorDict
@@ -97,7 +166,8 @@ mjlab_microduck.export.run_export = denied
 arena.runner.run_once = denied
 cfg = tyro.cli(TrainConfig, args=[], default=TrainConfig.from_task(learning.TASK), config=mjlab.TYRO_FLAGS)
 assert cfg.agent.resume and cfg.agent.algorithm.stage == "refine"
-assert cfg.agent.algorithm.reward_profile == "H1"
+profile = os.environ.get("MICRODUCK_HILL_REWARD_PROFILE", env.TRAINING["reward_profile"])
+assert cfg.agent.algorithm.reward_profile == profile
 assert cfg.agent.max_iterations == 500 and cfg.env.scene.num_envs == 2048
 assert cfg.agent.save_interval == 50 and cfg.agent.algorithm.learning_rate == .00005
 assert cfg.agent.algorithm.schedule == "fixed"
@@ -119,30 +189,44 @@ assert runner.alg.curriculum_clock == 24024 and runner.alg.reward_origin == 2402
 runner.alg.train_mode()
 marker = runner.alg.save()["hill_training_contract"]
 assert marker["source_identity"]["partial_exception"] == "model1000-3of5-exploration-only"
-runner.alg.reward_parameters = {**runner.alg.reward_parameters, "motion_speed": .5}
+parameters = runner.alg.reward_parameters
+from copy import deepcopy
+runner.alg.reward_parameters = deepcopy(parameters)
+if profile == "H1":
+ runner.alg.reward_parameters["motion_speed"] = .5
+else:
+ runner.alg.reward_parameters["rewards"]["upright"]["params"]["std"] = .5
 try:
  runner.load(source, map_location="cpu")
 except ValueError as error:
- assert "H1" in str(error)
+ assert profile in str(error)
 else:
- raise AssertionError("tampered target H1 parameters accepted")
-runner.alg.reward_parameters["motion_speed"] = .1
-plan = campaign.make_plan()
-assert plan["stage"] == "refine" and plan["reward_profile"] == "H1"
+ raise AssertionError("tampered target reward parameters accepted")
+runner.alg.reward_parameters = parameters
+plan = campaign.make_plan(**({"reward_profile": profile} if "MICRODUCK_HILL_REWARD_PROFILE" in os.environ else {}))
+assert plan["stage"] == "refine" and plan["reward_profile"] == profile
 assert plan["source_identity"] == marker["source_identity"]
 parsed = tyro.cli(TrainConfig, args=plan["command"][4:], default=TrainConfig.from_task(learning.TASK), config=mjlab.TYRO_FLAGS)
 assert parsed.agent.resume and parsed.agent.algorithm.source_identity == marker["source_identity"]
-assert parsed.agent.algorithm.reward_profile == "H1" and parsed.gpu_ids == [0]
+assert parsed.agent.algorithm.reward_profile == profile and parsed.gpu_ids == [0]
 import re
 assert re.fullmatch(parsed.agent.load_checkpoint, "model_1000.pt")
 assert not re.fullmatch(parsed.agent.load_checkpoint, "model_10000.pt")
 print("VERIFIED="+json.dumps({"tensors":count,"contract":marker,"weights":{n:t.weight for n,t in cfg.env.rewards.items()},"source_clock":raw.common_step_counter}))
 '''
     clean = {k: v for k, v in os.environ.items() if not k.startswith("MICRODUCK_HILL_")}
+    if explicit_profile is not None:
+        clean["MICRODUCK_HILL_REWARD_PROFILE"] = explicit_profile
     actual = subprocess.check_output([sys.executable, "-c", code], env={**clean, "MICRODUCK_SPRINT_STAGE": "baseline"}, text=True)
     verified = json.loads(actual.split("VERIFIED=")[1])
     assert verified["tensors"] > 20
     assert verified["weights"]["upright"] == 2.
+    if explicit_profile is None:
+        assert verified["contract"]["stability_gate"] is None
+        assert "horizontal_forward_speed" not in verified["weights"]
+    else:
+        assert "stability_gate" not in verified["contract"]
+        assert verified["weights"]["horizontal_forward_speed"] == 5.
 
 
 def test_partial_identity_cannot_omit_exception_or_be_used_for_exploitation():
@@ -525,6 +609,290 @@ def hill_source(tmp_path, monkeypatch):
               "per_seed": [{"seed": s, "status": "finish", "time_s": 5.} for s in range(1, 6)]}
     (folder / "workshop/model_0.json").write_text(json.dumps(result))
     return path, payload
+
+
+def _write_profile_descendant(source, payload, profile, folder):
+    """Synthetic checkpoint metadata, real source validation; never a training run."""
+    import json
+    from dataclasses import asdict
+    from microduck_challenges.hill_climb_1m5 import learning
+    selected = env.selected_training_source(source)
+    algorithm = asdict(env.refinement_algorithm(selected, "explore", profile))
+    agent = learning.config_data(env.BASE_RL_CFG)
+    agent["algorithm"] = algorithm
+    agent.update(max_iterations=1, save_interval=1)
+    cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]),
+                                     selected["curriculum_clock"], profile, reward_origin=selected["reward_origin"])
+    (folder / "params").mkdir(parents=True)
+    (folder / "workshop").mkdir()
+    (folder / "params/agent.yaml").write_text(yaml.safe_dump(agent, sort_keys=False))
+    (folder / "params/env.yaml").write_text(yaml.safe_dump(learning.config_data(cfg), sort_keys=False))
+    (folder / "provenance.json").write_text(json.dumps({"task": learning.TASK}))
+    saved = {**deepcopy(payload), "hill_reward_profile": profile,
+             "hill_training_contract": learning.training_contract(algorithm), "iter": 0,
+             "infos": {"env_state": {"common_step_counter": selected["clock"] + 24}}}
+    path = folder / "model_0.pt"
+    torch.save(saved, path)
+    result = json.loads((source.parent / "workshop" / f"{source.stem}.json").read_text())
+    result["checkpoint"] = 0
+    (folder / "workshop/model_0.json").write_text(json.dumps(result))
+    return path, saved, algorithm
+
+
+def test_s0_saves_full_canonical_parameters_and_strict_independent_source_identity(hill_source):
+    from microduck_challenges.hill_climb_1m5 import learning
+    path, payload = hill_source
+    child, saved, algorithm = _write_profile_descendant(path, payload, "S0", path.parent.with_name("s0"))
+    cfg = learning.config_data(learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24, "S0"))
+    assert algorithm["reward_parameters"] == {"rewards": cfg["rewards"], "terminations": cfg["terminations"]}
+    assert saved["hill_training_contract"]["stability_gate"] is None
+    assert saved["hill_training_contract"]["stability_gate_sha256"] is None
+    selected = env.selected_training_source(child)
+    assert selected["profile"] == "S0" and selected["partial_exception"] is None
+    assert selected["clock"] == 48 and selected["curriculum_clock"] == selected["reward_origin"] == 24
+    # Full canonical reconstruction ignores a different caller baseline, unlike trusting saved params.
+    changed = env.make_env_cfg(stage="bootstrap")
+    changed.rewards["upright"].params["std"] = 99.
+    assert learning.validate_source(child, changed, env.BASE_RL_CFG)["profile"] == "S0"
+    agent_path = child.parent / "params/agent.yaml"
+    agent = yaml.safe_load(agent_path.read_text())
+    agent["algorithm"]["reward_parameters"]["rewards"]["upright"]["params"]["std"] = .5
+    saved["hill_training_contract"] = learning.training_contract(agent["algorithm"])
+    agent_path.write_text(yaml.safe_dump(agent, sort_keys=False))
+    torch.save(saved, child)
+    with pytest.raises(ValueError, match="S0.*parameters|stability.*parameters"):
+        env.selected_training_source(child)
+
+
+def test_new_profiles_require_all_metadata_and_partial_descendants_never_inherit_exception(hill_source):
+    import json
+    from microduck_challenges.hill_climb_1m5 import learning
+    path, payload = hill_source
+    child, saved, algorithm = _write_profile_descendant(path, payload, "S0", path.parent.with_name("s0"))
+    agent_path = child.parent / "params/agent.yaml"
+    original_agent = agent_path.read_text()
+    for key in ("source_identity", "base_knobs", "reward_parameters", "reward_origin",
+                "source_clock", "curriculum_clock", "stability_gate", "stability_gate_sha256"):
+        agent = yaml.safe_load(original_agent)
+        agent["algorithm"].pop(key)
+        agent_path.write_text(yaml.safe_dump(agent, sort_keys=False))
+        altered = {**saved, "hill_training_contract": learning.training_contract(agent["algorithm"])}
+        torch.save(altered, child)
+        with pytest.raises(ValueError, match="S0|source|recipe|stability"):
+            env.selected_training_source(child)
+    agent_path.write_text(original_agent)
+    torch.save(saved, child)
+    result_path = child.parent / "workshop/model_0.json"
+    result = json.loads(result_path.read_text())
+    result["per_seed"][0].update(status="fall", time_s=None)
+    result.update(seeds_finished=4, score=16.)
+    result_path.write_text(json.dumps(result))
+    with pytest.raises(ValueError, match="5/5"):
+        env.selected_training_source(child)
+    # No generic exception may be supplied for a descendant, even with matching totals.
+    with pytest.raises(ValueError, match="pin|exception"):
+        learning.validate_source(child, env.make_env_cfg(stage="bootstrap"), env.BASE_RL_CFG,
+                                 exploratory_exception={**learning.APPROVED_PARTIAL, "source": str(child)})
+
+
+def _gate_boundary(monkeypatch, tmp_path):
+    """Only the independent overnight verifier is mocked; loader/digests are real."""
+    import sys
+    calls, candidates = [], {}
+    def require(gate_path, source, command_vx=.75):
+        assert command_vx == .75
+        calls.append((str(gate_path), str(source)))
+        return {"candidate_path": candidates[str(gate_path)]}
+    monkeypatch.setitem(sys.modules, "microduck_challenges.hill_climb_1m5.overnight",
+                        SimpleNamespace(require_stability_gate=require))
+    return calls, candidates
+
+
+def _profile_runner(selected, profile):
+    from dataclasses import asdict
+    from mjlab.tasks.registry import load_runner_cls
+    from tensordict import TensorDict
+    from microduck_challenges.hill_climb_1m5 import learning
+    agent = deepcopy(env.BASE_RL_CFG)
+    agent.algorithm = env.refinement_algorithm(selected, "explore", profile)
+    cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]),
+                                     selected["curriculum_clock"], profile)
+    raw = SimpleNamespace(common_step_counter=0)
+    obs = TensorDict({"actor": torch.zeros(1, 61), "critic": torch.zeros(1, 77)}, batch_size=[1])
+    wrapped = SimpleNamespace(unwrapped=raw, cfg=cfg, num_envs=1, num_actions=14,
+                              get_observations=lambda: obs)
+    return load_runner_cls(learning.TASK)(wrapped, asdict(agent), device="cpu")
+
+
+def test_p1_env_and_config_refuse_missing_stability_gate_and_nonstable_sources(hill_source, monkeypatch, tmp_path):
+    from microduck_challenges.hill_climb_1m5 import learning
+    path, payload = hill_source
+    stable, _, _ = _write_profile_descendant(path, payload, "S0", path.parent.with_name("s0"))
+    monkeypatch.delenv("MICRODUCK_HILL_STABILITY_GATE", raising=False)
+    monkeypatch.delenv("MICRODUCK_HILL_STABILITY_GATE_SHA256", raising=False)
+    selected = env.selected_training_source(stable)
+    with pytest.raises(ValueError, match="stability gate|Stability gate"):
+        env.make_env_cfg(stage="refine", reward_profile="P1", source=stable)
+    with pytest.raises(ValueError, match="stability gate|Stability gate"):
+        env.refinement_algorithm(selected, "explore", "P1")
+    # A gate report cannot turn an A0 source or original 3/5 E into a stable source.
+    calls, candidates = _gate_boundary(monkeypatch, tmp_path)
+    gate = tmp_path / "gate.json"
+    gate.write_text('{"stable": true}')
+    candidates[str(gate)] = str(path)
+    monkeypatch.setenv("MICRODUCK_HILL_STABILITY_GATE", str(gate))
+    with pytest.raises(ValueError, match="S0|P1|stable|partial"):
+        env.refinement_algorithm(env.selected_training_source(path), "explore", "P1")
+    assert not calls
+
+
+def test_s0_strict_loader_rejects_tampered_pinned_source_markers_and_preserves_fresh_restore(hill_source):
+    path, payload = hill_source
+    selected = env.selected_training_source(path)
+    runner = _profile_runner(selected, "S0")
+    runner.load(str(path), map_location="cpu")
+    assert not runner.alg.optimizer.state and runner.current_learning_iteration == 0
+    assert runner.env.unwrapped.common_step_counter == runner.alg.curriculum_clock == 24
+    for key, value in (("hill_reward_profile", "P1"), ("hill_exploration_std_scale", .5),
+                       ("iter", 1), ("hill_campaign_plan_digest", "0" * 64)):
+        changed = {**deepcopy(payload), key: value}
+        with pytest.raises(ValueError, match="pinned.*source|source.*marker"):
+            runner.alg.load(changed)
+        with pytest.raises(RuntimeError, match="strict source restore"):
+            runner.alg.train_mode()
+    changed = deepcopy(payload)
+    changed["actor_state_dict"]["obs_normalizer._mean"][0, 0] += 1.
+    with pytest.raises(ValueError, match="tensors.*pinned"):
+        runner.alg.load(changed)
+    runner.load(str(path), map_location="cpu")
+    for name in ("actor", "critic"):
+        for key, value in getattr(runner.alg, name).state_dict().items():
+            torch.testing.assert_close(value, payload[f"{name}_state_dict"][key], rtol=0, atol=0)
+
+
+def test_p1_load_requires_exact_digest_bound_gate_and_preserves_full_state(hill_source, monkeypatch, tmp_path):
+    from microduck_challenges.hill_climb_1m5 import evidence, learning
+    source, payload = hill_source
+    stable, saved, _ = _write_profile_descendant(source, payload, "S0", source.parent.with_name("s0"))
+    selected = env.selected_training_source(stable)
+    calls, candidates = _gate_boundary(monkeypatch, tmp_path)
+    gate = tmp_path / "stability.json"
+    gate.write_text('{"unit_boundary": "not real stability evidence"}')
+    original_gate = gate.read_bytes()
+    candidates[str(gate)] = str(stable)
+    monkeypatch.setenv("MICRODUCK_HILL_STABILITY_GATE", str(gate))
+    cfg = env.make_env_cfg(stage="refine", reward_profile="P1", source=stable)
+    assert cfg.rewards["horizontal_forward_speed"].weight == 1.
+    assert calls[-1] == (str(gate), str(stable))
+    runner = _profile_runner(selected, "P1")
+    assert runner.alg.stability_gate == str(gate)
+    assert runner.alg.stability_gate_sha256 == evidence.digest(gate)
+    calls.clear()
+    runner.load(str(stable), map_location="cpu")
+    assert calls == [(str(gate), str(stable))]
+    assert not runner.alg.optimizer.state and runner.current_learning_iteration == 0
+    assert runner.env.unwrapped.common_step_counter == 48 and runner.alg.curriculum_clock == 24
+    runner.alg.train_mode()
+    for name in ("actor", "critic"):
+        for key, value in getattr(runner.alg, name).state_dict().items():
+            torch.testing.assert_close(value, saved[f"{name}_state_dict"][key], rtol=0, atol=0)
+    marker = runner.alg.save()["hill_training_contract"]
+    assert marker["stability_gate_sha256"] == evidence.digest(gate)
+    # An ambient valid path must not repair missing saved loader fields.
+    runner.alg.stability_gate = None
+    with pytest.raises(ValueError, match="stability gate|Stability gate"):
+        runner.alg.load(saved)
+    runner.alg.stability_gate = str(gate)
+    gate.write_bytes(original_gate + b"\n")
+    with pytest.raises(ValueError, match="digest|sha256|changed"):
+        runner.alg.load(saved)
+    with pytest.raises(RuntimeError, match="strict source restore"):
+        runner.alg.train_mode()
+    gate.write_bytes(original_gate)
+    candidates[str(gate)] = str(source)
+    with pytest.raises(ValueError, match="exact source|candidate"):
+        runner.alg.load(saved)
+    candidates[str(gate)] = str(stable)
+    monkeypatch.setenv("MICRODUCK_HILL_STABILITY_GATE_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="digest|sha256|changed"):
+        env.make_env_cfg(stage="refine", reward_profile="P1", source=stable)
+    # P1 inference does not require a training gate, critic, source clocks or Adam.
+    play = _hill_runner(play=True, stage="refine")
+    play.alg.reward_profile = "P1"
+    play.alg.stability_gate = play.alg.stability_gate_sha256 = None
+    play.alg.load({"actor_state_dict": deepcopy(play.alg.actor.state_dict())})
+    with pytest.raises(RuntimeError, match="inference-only"):
+        play.alg.train_mode()
+    assert env.make_env_cfg(play=True, stage="refine", reward_profile="P1", source=stable)
+
+
+def test_p1_descendants_restore_canonical_recipe_but_new_continuation_needs_own_exact_source_gate(hill_source, monkeypatch, tmp_path):
+    from microduck_challenges.hill_climb_1m5 import learning
+    path, payload = hill_source
+    stable, saved, _ = _write_profile_descendant(path, payload, "S0", path.parent.with_name("s0"))
+    calls, candidates = _gate_boundary(monkeypatch, tmp_path)
+    gate = tmp_path / "s0-gate.json"
+    gate.write_text('{"unit_boundary": "s0-gate"}')
+    candidates[str(gate)] = str(stable)
+    monkeypatch.setenv("MICRODUCK_HILL_STABILITY_GATE", str(gate))
+    child, child_saved, algorithm = _write_profile_descendant(stable, saved, "P1", path.parent.with_name("p1"))
+    selected = env.selected_training_source(child)
+    assert selected["profile"] == "P1" and selected["clock"] == 72 and selected["curriculum_clock"] == 24
+    with pytest.raises(ValueError, match="exact source|candidate"):
+        env.refinement_algorithm(selected, "explore", "P1")
+    next_gate = tmp_path / "p1-gate.json"
+    next_gate.write_text('{"unit_boundary": "p1-gate"}')
+    candidates[str(next_gate)] = str(child)
+    monkeypatch.setenv("MICRODUCK_HILL_STABILITY_GATE", str(next_gate))
+    assert env.refinement_algorithm(selected, "explore", "P1").stability_gate == str(next_gate)
+    # Tamper all three copies consistently: canonical reconstruction must still reject.
+    agent_path, cfg_path = child.parent / "params/agent.yaml", child.parent / "params/env.yaml"
+    agent = yaml.safe_load(agent_path.read_text())
+    agent["algorithm"]["reward_parameters"]["rewards"]["horizontal_forward_speed"]["weight"] = 2.5
+    child_saved["hill_training_contract"] = learning.training_contract(agent["algorithm"])
+    agent_path.write_text(yaml.safe_dump(agent, sort_keys=False))
+    torch.save(child_saved, child)
+    cfg = yaml.safe_load(cfg_path.read_text())
+    cfg["rewards"]["horizontal_forward_speed"]["weight"] = 2.5
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    with pytest.raises(ValueError, match="P1.*parameters|stability.*parameters"):
+        env.selected_training_source(child)
+
+
+def test_historical_h1_contract_fields_and_real_archive_remain_compatible():
+    from microduck_challenges.hill_climb_1m5 import learning, evidence
+    from mjlab.tasks.registry import load_runner_cls
+    from tensordict import TensorDict
+    source = Path("logs/rsl_rl/hill_climb_1m5/2026-10-25_00-52-22_run-1025-0052/model_0.pt")
+    if not source.exists():
+        pytest.skip("Historical authentic H1 archive is not available on portable clones")
+    saved_agent = learning.read_config(source.parent / "params/agent.yaml")
+    algorithm = saved_agent["algorithm"]
+    assert algorithm["reward_profile"] == "H1"
+    assert "stability_gate" not in algorithm and "stability_gate_sha256" not in algorithm
+    assert set(learning.training_contract(algorithm)) == set(learning.CONTRACT_FIELDS)
+    before = evidence.digest(source)
+    # Static compatibility only: this partial checkpoint is not an eligible training source.
+    selected = learning.validate_source(source, env.make_env_cfg(stage="bootstrap"), env.BASE_RL_CFG,
+                                        require_result=False)
+    assert selected["profile"] == "H1" and evidence.digest(source) == before
+    cfg = env.make_env_cfg(play=True, stage="bootstrap")
+    raw = SimpleNamespace(common_step_counter=0)
+    cfg.events["actor_only_inference"].func(raw)
+    obs = TensorDict({"actor": torch.zeros(1, 61), "critic": torch.zeros(1, 77)}, batch_size=[1])
+    wrapped = SimpleNamespace(unwrapped=raw, cfg=cfg, num_envs=1, num_actions=14,
+                              get_observations=lambda: obs)
+    runner = load_runner_cls(learning.TASK)(wrapped, saved_agent, device="cpu")
+    runner.load(str(source), map_location="cpu")
+    saved = torch.load(source, map_location="cpu", weights_only=False)
+    assert runner.alg._hill_inference_only and not runner.alg.optimizer.state
+    for key, value in runner.alg.actor.state_dict().items():
+        torch.testing.assert_close(value, saved["actor_state_dict"][key], rtol=0, atol=0)
+    assert evidence.digest(source) == before
+    with pytest.raises(RuntimeError, match="inference-only"):
+        runner.alg.train_mode()
+    with pytest.raises(ValueError, match="5/5"):
+        env.selected_training_source(source)
 
 
 def test_source_validation_binds_hill_task_order_recipe_profile_and_both_clocks(hill_source):

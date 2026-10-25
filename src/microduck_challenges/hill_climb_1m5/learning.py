@@ -14,7 +14,9 @@ from rsl_rl.algorithms import PPO
 
 TASK = "Mjlab-HillClimb1m5-MicroDuck"
 LOG_ROOT = Path("logs/rsl_rl/hill_climb_1m5").resolve()
-REWARD_PROFILES = {"A0": {}, "A1": {"track_linear_velocity": 0.0}, "B1": {"air_time": 1.5}, "H1": {}}
+REWARD_PROFILES = {"A0": {}, "A1": {"track_linear_velocity": 0.0}, "B1": {"air_time": 1.5},
+                   "H1": {}, "S0": {}, "P1": {}}
+STABILITY_PROFILES = frozenset(("S0", "P1"))
 
 # User-authorized exception for ONE genuine artifact, never a relaxed global gate.
 APPROVED_PARTIAL = {
@@ -164,6 +166,9 @@ def refinement_recipe(cfg, clock, profile, *, reward_origin=None):
     if profile == "H1":
         from .rewards import configure_h1
         cfg = configure_h1(cfg, clock if reward_origin is None else reward_origin)
+    elif profile in STABILITY_PROFILES:
+        from .rewards import configure_stability
+        cfg = configure_stability(cfg, profile)
     return cfg
 
 
@@ -181,15 +186,94 @@ class HillPpoCfg(PpoWithSymmetryCfg):
     base_knobs: dict | None = None
     reward_origin: int = 0
     reward_parameters: dict | None = None
+    stability_gate: str | None = None
+    stability_gate_sha256: str | None = None
 
 
 CONTRACT_FIELDS = ("learning_phase", "source_identity", "base_knobs", "reward_origin", "reward_parameters")
 
 
 def training_contract(algorithm):
+    # Historical H1 markers predate Gate S. Do not add keys to their contract.
+    fields = CONTRACT_FIELDS
+    profile = algorithm.get("reward_profile") if isinstance(algorithm, dict) else getattr(algorithm, "reward_profile", None)
+    if profile in STABILITY_PROFILES:
+        fields += ("stability_gate", "stability_gate_sha256")
     if isinstance(algorithm, dict):
-        return {k: algorithm.get(k) for k in CONTRACT_FIELDS}
-    return {k: getattr(algorithm, k, None) for k in CONTRACT_FIELDS}
+        return {k: algorithm.get(k) for k in fields}
+    return {k: getattr(algorithm, k, None) for k in fields}
+
+
+def stability_parameters(cfg):
+    """Persist EVERY canonical reward's function, weight and parameters + guards."""
+    data = config_data(cfg)
+    return {"rewards": data["rewards"], "terminations": data["terminations"]}
+
+
+def stability_gate_binding(selected, gate_path, gate_sha256=None):
+    """Require raw-evidence Gate S for THIS exact normal-5/5 S0/P1 source.
+
+    Configuration creation may pin a newly verified report digest. Restoration
+    must pass the already saved digest, never repair it from ambient variables.
+    The verifier is lazy so ordinary S0 imports and actor-only inference do not
+    depend on overnight supervision or evaluation code.
+    """
+    from .evidence import digest
+    if selected["profile"] not in STABILITY_PROFILES or selected["partial_exception"] is not None:
+        raise ValueError("P1 requires a normal official 5/5 S0/P1 source, never a partial exception")
+    if not isinstance(gate_path, (str, Path)) or not str(gate_path).strip():
+        raise ValueError("P1 requires a verified stability gate for the exact source")
+    if gate_sha256 is not None and (not isinstance(gate_sha256, str)
+                                    or not re.fullmatch(r"[0-9a-f]{64}", gate_sha256)):
+        raise ValueError("Invalid stability gate sha256 digest")
+    path = Path(gate_path).resolve()
+    try:
+        actual = digest(path)
+    except OSError as error:
+        raise ValueError("Missing stability gate report") from error
+    if gate_sha256 is not None and actual != gate_sha256:
+        raise ValueError("Stability gate digest changed")
+    from .overnight import require_stability_gate
+    source = str(selected["path"])
+    report = require_stability_gate(path, source, command_vx=.75)
+    if not isinstance(report, dict) or report.get("candidate_path") != source:
+        raise ValueError("Stability gate candidate must equal the exact source")
+    if digest(path) != actual:
+        raise ValueError("Stability gate report changed during verification")
+    return str(path), actual
+
+
+def validate_stability_contract(algorithm):
+    """Reconstruct S0/P1 independently from their pinned ancestor, never metadata alone."""
+    from .env import make_env_cfg, selected_training_source
+    profile = algorithm["reward_profile"]
+    required = ("source_identity", "base_knobs", "source_clock", "curriculum_clock",
+                "reward_origin", "reward_parameters", "learning_phase", "stability_gate", "stability_gate_sha256")
+    if (profile not in STABILITY_PROFILES or any(k not in algorithm for k in required)
+            or not isinstance(algorithm["source_identity"], dict)
+            or algorithm["learning_phase"] not in ("explore", "exploit")):
+        raise ValueError(f"Invalid {profile} stability source/parameters contract")
+    identity = algorithm["source_identity"]
+    verify_source_identity(identity)
+    selected = selected_training_source(identity["path"], phase=algorithm["learning_phase"])
+    if (identity != selected["source_identity"] or algorithm["base_knobs"] != selected["base_knobs"]
+            or any(type(algorithm[k]) is not int or algorithm[k] != selected[k] for k in
+                   ("curriculum_clock", "reward_origin"))
+            or type(algorithm["source_clock"]) is not int or algorithm["source_clock"] != selected["clock"]):
+        raise ValueError(f"Invalid {profile} stability source recipe/clocks")
+    canonical = refinement_recipe(make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]),
+                                   selected["curriculum_clock"], profile)
+    if algorithm["reward_parameters"] != stability_parameters(canonical):
+        raise ValueError(f"Invalid {profile} stability reward parameters")
+    if profile == "S0" and any(algorithm[k] is not None for k in ("stability_gate", "stability_gate_sha256")):
+        raise ValueError("S0 stability does not carry an acceleration gate")
+    if profile == "P1":
+        if not isinstance(algorithm["stability_gate_sha256"], str):
+            raise ValueError("P1 requires its saved stability gate digest")
+        binding = stability_gate_binding(selected, algorithm["stability_gate"], algorithm["stability_gate_sha256"])
+        if binding != (algorithm["stability_gate"], algorithm["stability_gate_sha256"]):
+            raise ValueError("Invalid saved P1 stability gate binding")
+    return canonical
 
 
 def verify_source_identity(identity):
@@ -232,7 +316,7 @@ class HillPPO(PPO):
     def __init__(self, *args, stage="bootstrap", reward_profile="A0", source_clock=0, curriculum_clock=0,
                  exploration_std_scale=1.0, campaign_journal=None, campaign_plan_digest=None,
                  learning_phase="explore", source_identity=None, base_knobs=None,
-                 reward_origin=0, reward_parameters=None, **kwargs):
+                 reward_origin=0, reward_parameters=None, stability_gate=None, stability_gate_sha256=None, **kwargs):
         reward_overrides(reward_profile)
         if stage not in ("bootstrap", "refine") or (stage == "bootstrap" and reward_profile != "A0"):
             raise ValueError("Hill bootstrap requires A0; unknown stages are refused")
@@ -243,6 +327,7 @@ class HillPPO(PPO):
         self.campaign_journal, self.campaign_plan_digest = campaign_journal, campaign_plan_digest
         self.learning_phase, self.source_identity, self.base_knobs = learning_phase, source_identity, base_knobs
         self.reward_origin, self.reward_parameters = reward_origin, reward_parameters
+        self.stability_gate, self.stability_gate_sha256 = stability_gate, stability_gate_sha256
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -283,6 +368,9 @@ class HillPPO(PPO):
         if os.environ.get("MICRODUCK_WARM_START", "") not in ("", "0"):
             raise ValueError("MICRODUCK_WARM_START would restart Hill environment curricula")
         identity = getattr(self, "source_identity", None)
+        if self.reward_profile in STABILITY_PROFILES:
+            validate_stability_contract({**training_contract(self), "reward_profile": self.reward_profile,
+                "source_clock": self.source_clock, "curriculum_clock": self.curriculum_clock})
         if self.reward_profile == "H1" and identity is None:
             raise ValueError("H1 training requires its exact source identity pins")
         if self.reward_profile == "H1":
@@ -299,6 +387,11 @@ class HillPPO(PPO):
             if identity["partial_exception"] and self.learning_phase != "explore":
                 raise ValueError("The partial-source exception is exploration only")
             original = torch.load(identity["path"], map_location="cpu", weights_only=False)
+            if self.reward_profile in STABILITY_PROFILES:
+                markers = ("hill_reward_profile", "hill_exploration_std_scale", "iter",
+                           "hill_campaign_journal", "hill_campaign_plan_digest")
+                if any(loaded_dict.get(k) != original.get(k) for k in markers):
+                    raise ValueError("Restored source markers differ from pinned Hill source")
             for name in ("actor_state_dict", "critic_state_dict"):
                 if set(loaded_dict[name]) != set(original[name]) or any(
                         not torch.equal(loaded_dict[name][k].cpu(), v) for k, v in original[name].items()):
@@ -356,6 +449,8 @@ def validate_source(path, baseline, agent, *, require_result=True, exploratory_e
         raise ValueError("Unrecognized Hill source algorithm")
     canonical = deepcopy(baseline)
     if source_stage == "refine":
+        if profile in STABILITY_PROFILES:
+            validate_stability_contract(algorithm)
         if algorithm.get("source_identity") is not None:
             from .env import make_env_cfg
             verify_source_identity(algorithm["source_identity"])
@@ -407,8 +502,8 @@ def validate_source(path, baseline, agent, *, require_result=True, exploratory_e
         if saved_agent[name] != wanted_agent[name]:
             raise ValueError(f"Incompatible Hill {name}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if (profile == "H1" or algorithm.get("source_identity") is not None) and payload.get("hill_training_contract") != training_contract(algorithm):
-        raise ValueError("Checkpoint and saved H1 training contract disagree")
+    if (profile in STABILITY_PROFILES or profile == "H1" or algorithm.get("source_identity") is not None) and payload.get("hill_training_contract") != training_contract(algorithm):
+        raise ValueError("Checkpoint and saved Hill training contract disagree")
     campaign_evidence(path, saved_agent, payload)
     if payload.get("hill_reward_profile", "A0") != profile:
         raise ValueError("Checkpoint and saved reward profile disagree")
