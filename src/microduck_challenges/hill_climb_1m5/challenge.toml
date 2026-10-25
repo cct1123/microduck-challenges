@@ -60,19 +60,19 @@ heldout_seed_count = 20
 
 [params.forward_reward]
 label = "Follow the speed order"
-value = 5.0
+value = 3.01506696428571
 min   = 0.5
 max   = 5.0
 
 [params.upright_reward]
 label = "Stay upright"
-value = 1.00167410714286
+value = 2.95228794642857
 min   = 0.5
 max   = 5.0
 
 [params.step_reward]
 label = "Lift your feet"
-value = 6.0
+value = 4.03645833333333
 min   = 0.0
 max   = 6.0
 
