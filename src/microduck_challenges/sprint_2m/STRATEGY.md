@@ -2,7 +2,7 @@
 
 ## Opt-in reward experiments and plateau audit
 
-The next Workshop/train run defaults to **C2**, selected explicitly by
+The next Workshop/train run defaults to **C3**, selected explicitly by
 `training.reward_profile` in `challenge.toml`. Campaign plan/run/smoke use the
 same default. The `--reward-profile` option selects one explicitly named recipe:
 
@@ -14,9 +14,10 @@ same default. The `--reward-profile` option selects one explicitly named recipe:
 | `B2` | `speed_forward` weight -> 18; does NOT include A1 or B1 |
 | `C1` | Explicit combination: tracking -> 0 AND air time -> 3; only air time differs from A1 |
 | `C2` | C1 plus course-speed weight -> 18; only speed weight differs from C1 |
+| `C3` | C2 plus `upright.motion_speed` -> 0.1 m/s; only the lean-speed parameter differs from C2 |
 
-These are hypotheses, not demonstrated speed gains. C2 is prepared, not yet GPU
-trained. Its comparison restarts from the same retained model_8250 and keeps
+These are hypotheses, not demonstrated speed gains. The C2 comparison starts
+from the same retained model_8250 and keeps
 C1's seed 2, 2,048 environments and 500-update budget. Course-speed weight
 12 -> 18 is its ONLY reward change relative to C1: tracking remains 0, air time
 remains 3, and heading, upright, safety, physics and PPO controls are unchanged.
@@ -29,10 +30,34 @@ reward profile. A legacy checkpoint without a marker means A0. Promotion to
 exploitation must retain the source's reward profile; changing it needs a new
 exploration/assessment, not an old approval applied to a new reward.
 
+### Earlier forward-lean tolerance (C3)
+
+C3 changes only `upright.params.motion_speed`: 0.5 -> 0.1 m/s. At the mature
+refinement clock, forward-pitch variance ramps linearly from its standing value
+at zero actual course speed to the existing full variance 0.80 at 0.1 m/s,
+instead of 0.5 m/s. This is full allowance BY 0.1, not a new hard switch ABOVE
+0.1. The input is measured spawn-course velocity, not the commanded speed.
+Stationary/reverse travel, roll and backward lean retain their previous
+penalties. The upright optimum remains upright; forward lean is less costly,
+not directly rewarded. Brief tilt cap 70 degrees and the independent held-fall
+rule (>60 degrees for 0.3 seconds) remain unchanged.
+
+Do NOT edit `training.drive.motion_speed` or the refinement construction scalar
+in place: these reconstruct archived source recipes for strict validation.
+C3's explicit parameter override is applied only after validating the source,
+and its identity/parameter are checked in saved descendants and live smoke
+steps. A0–C2 keep their old semantics. Logged weight-reweight estimates do not
+rescore a changed lean parameter or predict its learned gait.
+
+Prepare this change outside the live source while a Sprint trainer is active.
+Apply the prepared patch only after that run exits and the protected source
+hashes still match. Do not stop/restart the active run, change PPO or budgets,
+promote a checkpoint, or launch another run as part of preparing C3.
+
 The CLI is non-launching without the existing explicit `run --execute` switch:
 
 ```bash
-uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C2
+uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C3
 ```
 
 `--reward-profile A0` selects the unchanged control. An explicit
@@ -110,7 +135,7 @@ smoke/export check in a fresh directory:
 
 ```bash
 uv run --group workshop python -m microduck_challenges.sprint_2m.campaign smoke \
-  --phase explore --reward-profile C2 --output logs/verification/my-c2-smoke
+  --phase explore --reward-profile C3 --output logs/verification/my-c3-smoke
 ```
 
 This verifies software/restore/export only, not improved racing performance.
