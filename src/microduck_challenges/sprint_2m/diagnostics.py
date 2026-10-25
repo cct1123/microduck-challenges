@@ -10,7 +10,7 @@ from pathlib import Path
 import yaml
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-from .experiments import REWARD_PROFILES, reward_overrides
+from .experiments import REWARD_PROFILES, reward_overrides, reward_parameter_overrides
 from .promotion import digest
 from .rewards import _ConfigLoader
 
@@ -117,6 +117,9 @@ def audit_run(run, iteration, radius=10):
             "varying_weight_terms_not_rescored": sorted(varying),
             "positive_logged_sum": positive, "negative_logged_sum": negative,
             "fixed_logged_data_weight_estimates": estimates,
+            "parameter_overrides_not_rescored": {profile: reward_parameter_overrides(profile)
+                                                for profile in REWARD_PROFILES
+                                                if reward_parameter_overrides(profile)},
             "metrics": {tag: summary for tag, values in series.items()
                         if not tag.startswith("Episode_Reward/")
                         and (summary := _summary(values, iteration, radius)) is not None},
@@ -140,7 +143,9 @@ def markdown_report(report):
                   "A0: unchanged control. A1: linear tracking -> 0. "
                   "B1: air time -> 3. B2: course speed -> 18. "
                   "C1: linear tracking -> 0 AND air time -> 3; compared with A1 only air time changes. "
-                  "C2: C1 plus course speed -> 18; compared with C1 only speed weight changes.",
+                  "C2: C1 plus course speed -> 18; compared with C1 only speed weight changes. "
+                  "C3: C2 plus upright.motion_speed -> 0.1; full forward-lean tolerance by 0.1 m/s.",
+                  "Reward-parameter changes cannot be rescored from logged reward sums.",
                   "These are unvalidated experiments; select by legal finish time and completion, not larger reward."])
     return "\n".join(lines) + "\n"
 

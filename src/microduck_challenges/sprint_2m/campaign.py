@@ -21,7 +21,7 @@ import yaml
 
 from . import env as sprint_env
 from .learning import phase_settings
-from .experiments import REWARD_PROFILES, reward_overrides
+from .experiments import REWARD_PROFILES, reward_overrides, reward_parameter_overrides
 from .promotion import digest, promotion_decision, read_report, require_promotion, runtime_signature, saved_checkpoints, summarize
 from .rewards import _ConfigLoader, _config_data, configure_refine_locomotion, select_sprint_checkpoint
 
@@ -83,6 +83,7 @@ def make_plan(phase, source=None, promotion_path=None, iterations=None, seed=Non
     target = configure_refine_locomotion(sprint_env.make_env_cfg(stage="baseline"),
                                          sprint_env.REFINE_SETTINGS, selected, reward_profile=reward_profile)
     return {"phase": phase, "reward_profile": reward_profile, "reward_overrides": overrides,
+            "reward_parameter_overrides": reward_parameter_overrides(reward_profile),
             "source_reward_profile": source_profile,
             "source_reward_weights": {k: v["weight"] for k, v in selected["source_env"]["rewards"].items()},
             "target_reward_weights": {k: v.weight for k, v in target.rewards.items()},
@@ -291,6 +292,7 @@ def smoke(phase, source, output, reward_profile=None):
     restored_tensors = 0
     live_reward_checks = 0
     expected_weights = {k: v.weight for k, v in cfg.env.rewards.items()}
+    expected_parameters = reward_parameter_overrides(reward_profile)
 
     def check_live_weights(runner):
         nonlocal live_reward_checks
@@ -298,6 +300,10 @@ def smoke(phase, source, output, reward_profile=None):
         actual = {name: manager.get_term_cfg(name).weight for name in expected_weights}
         if actual != expected_weights:
             raise ValueError("Live reward weights changed from the requested experiment")
+        for name, params in expected_parameters.items():
+            actual_params = manager.get_term_cfg(name).params
+            if any(actual_params.get(key) != value for key, value in params.items()):
+                raise ValueError("Live reward parameters changed from the requested experiment")
         live_reward_checks += 1
 
     def checked_load(runner, path, *args, **kwargs):
@@ -354,6 +360,7 @@ def smoke(phase, source, output, reward_profile=None):
         raise ValueError("Nonfinite smoke metrics or changed source")
     export = export_actor(log_dir / "model_1.pt", output / "verified.onnx")
     report = {"phase": phase, "reward_profile": reward_profile,
+              "reward_parameter_overrides": expected_parameters,
               "reward_weights": {k: v.weight for k, v in cfg.env.rewards.items()},
               "controls": controls, "device": "cpu", "updates": 2,
               "restored_state_tensors": restored_tensors, "source": str(source),
@@ -486,7 +493,7 @@ def main():
     parser.add_argument("--phase", choices=("explore", "exploit"), default="explore")
     parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default=None,
                         help="A0 control; A1 tracking off; B1 air time 3; B2 speed 18; "
-                             "C1 tracking off + air time 3; C2 C1 + speed 18")
+                             "C1 tracking off + air time 3; C2 C1 + speed 18; C3 C2 + full lean at 0.1 m/s")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--promotion", type=Path)
     parser.add_argument("--iterations", type=int)

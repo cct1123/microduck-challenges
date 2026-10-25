@@ -33,7 +33,7 @@ max   = 6.0
 [training]
 stage = "refine"
 phase = "explore"
-reward_profile = "C2"      # C1 plus course-speed 12 -> 18; other rewards unchanged
+reward_profile = "C3"      # C2 plus full forward-lean tolerance by 0.1 m/s
 
 [training.phases.explore]
 max_iterations = 500

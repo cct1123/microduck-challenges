@@ -10,7 +10,10 @@ REWARD_PROFILES = {
     "B2": {"speed_forward": 18.0},
     "C1": {"track_linear_velocity": 0.0, "air_time": 3.0},
     "C2": {"track_linear_velocity": 0.0, "air_time": 3.0, "speed_forward": 18.0},
+    "C3": {"track_linear_velocity": 0.0, "air_time": 3.0, "speed_forward": 18.0},
 }
+
+REWARD_PARAMETER_OVERRIDES = {"C3": {"upright": {"motion_speed": 0.1}}}
 
 
 def reward_overrides(profile):
@@ -18,6 +21,12 @@ def reward_overrides(profile):
     if not isinstance(profile, str) or profile not in REWARD_PROFILES:
         raise ValueError(f"Unknown Sprint reward profile: {profile!r}")
     return dict(REWARD_PROFILES[profile])
+
+
+def reward_parameter_overrides(profile):
+    """Copy explicit parameter changes without redefining historical profiles."""
+    reward_overrides(profile)
+    return {name: dict(params) for name, params in REWARD_PARAMETER_OVERRIDES.get(profile, {}).items()}
 
 
 def resolve_reward_profile(training, stage, override=None):
@@ -45,4 +54,11 @@ def apply_reward_profile(cfg, profile):
             if params.get("reward_name") == name:
                 for entry in params.get("weight_stages", []):
                     entry["weight"] = weight
+    for name, params in reward_parameter_overrides(profile).items():
+        if name not in cfg.rewards:
+            raise ValueError(f"Reward profile {profile} requires {name}")
+        for key, value in params.items():
+            if key not in cfg.rewards[name].params or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid reward parameter override: {name}.{key}")
+        cfg.rewards[name].params.update(params)
     return cfg
