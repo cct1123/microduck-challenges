@@ -82,7 +82,8 @@ uv run --group workshop pytest tests/test_hill_lite.py
 uv run --group workshop pytest
 
 # Exactly two CPU environments and two 24-step updates; explicit seed, fresh path.
-# Tests must pass first. The ONNX includes normalization and checks finite parity.
+# Tests must pass first. Both custom and installed Workshop/publish exports are
+# checked against the saved actor + normalizer, with finite CPU 61→14 parity.
 uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign smoke \
   --seed 4 --output /absolute/new/output-directory
 
@@ -116,6 +117,19 @@ It does not submit paid jobs, stop pre-existing jobs, commit, push or publish.
 Raw Workshop/`train` uses the bootstrap recipe but does **not** inherit the
 wrapper's watchdog/lock; arbitrary CLI overrides are not a bounded campaign.
 
+New bounded campaigns save an absolute launch-journal path and deterministic
+plan digest in **both** `params/agent.yaml` and every checkpoint. The digest
+covers the immutable plan (task, source/manifest hashes, budgets, seed, stage,
+profile and run name), not mutable PID/state fields. Source validation checks
+these independent bindings before any target reward override. Assessment and
+exploitation require the exact linked journal to be terminal `completed`, exit
+zero, with both unchanged-source flags true and every frozen artifact still
+matching. Missing/partial/mismatched bindings, tampered plans, running/failed
+journals and `source_changed_not_promotable` are rejected; no log-directory scan
+or caller-supplied optional journal can bypass the veto. Ordinary Workshop/
+`train` checkpoints with both metadata fields absent/None remain supported and
+are not retroactively claimed to have bounded-launch provenance.
+
 ## Assessment gates
 
 1. Reconcile **every** expected checkpoint using the saved budget/cadence,
@@ -135,7 +149,9 @@ wrapper's watchdog/lock; arbitrary CLI overrides are not a bounded campaign.
    counts **60 seconds**, never a dropped row.
 6. Recompute approval from complete raw rows, bind reports to their persisted JSONL,
    exports/checkpoints/config hashes, event/evaluator/version signature and unchanged
-   inventory. An `approved=true` field by itself authorizes nothing.
+   inventory. Record exact linked journal/plan/frozen-manifest hashes, recheck at
+   assessment start/end and again before exploitation. An `approved=true` field
+   by itself authorizes nothing; a launcher's source-change veto stays binding.
 
 Held-outs can lose independence through repeated reuse. Passing this software
 gate is neither a statistical guarantee, an Arena leaderboard result nor physical
@@ -157,3 +173,18 @@ There was no genuine reliable Hill source, so no end-to-end trained refinement,
 real paired Arena assessment, long/GPU training or racing improvement is claimed.
 The untrained smoke checkpoint is **not** installed as an incumbent or given
 fabricated 5/5 evidence. Bootstrap must first learn a reliable hill gait.
+
+The standard smoke now also invokes installed
+`mjlab_microduck.export.run_export(ExportConfig(device="cpu", num_envs=1, ...))`
+on its newly saved final checkpoint, writing a separate `official.onnx`. Both
+exports must produce finite `[1,61] → [1,14]` outputs matching the saved Torch
+actor/normalizer on eight inputs, and the official artifact must also match the
+validated custom export. `smoke.json` records both hashes and parity errors.
+This uses the registered play-only actor restore, never training restoration or
+a 5/5 gate on the untrained new checkpoint. A refinement smoke still requires
+genuine 5/5 evidence for its **input** source. Negative normalizer deviations
+are rejected on every loading/export path; legitimate zero variance is allowed.
+
+The latest correction verification is unit-only at the user's request: the new
+standard-smoke/official-export integration has not been executed. No new rollout,
+training, publication or racing-performance result is claimed.
