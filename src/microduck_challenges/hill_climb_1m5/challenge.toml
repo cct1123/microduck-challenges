@@ -6,7 +6,7 @@ kind  = "perpetual"
 
 [recipe]                  # next bounded exploration; bootstrap remains explicit
 num_envs       = 2048
-max_iterations = 500
+max_iterations = 3000
 seed           = 1
 
 # Bootstrap keeps the original beginner curriculum and optimization recipe.
@@ -60,7 +60,7 @@ heldout_seed_count = 20
 
 [params.forward_reward]
 label = "Follow the speed order"
-value = 3.01506696428571
+value = 5.0
 min   = 0.5
 max   = 5.0
 
@@ -72,7 +72,7 @@ max   = 5.0
 
 [params.step_reward]
 label = "Lift your feet"
-value = 4.03645833333333
+value = 6.0
 min   = 0.0
 max   = 6.0
 
