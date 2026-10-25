@@ -195,9 +195,9 @@ def test_scoring_and_launch_defaults_fail_closed(tmp_path, monkeypatch):
 
 def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypatch):
     _, selected = source
-    assert env.STAGE_SETTINGS["reward_profile"] == "A1"
+    assert env.STAGE_SETTINGS["reward_profile"] == "C1"
     default = experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine")
-    assert default == "A1"
+    assert default == "C1"
     assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine", "A0") == "A0"
     assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "baseline") == "A0"
     with pytest.raises(ValueError, match="strict refinement"):
@@ -209,4 +209,29 @@ def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypat
     assert cfg.rewards["track_linear_velocity"].weight == 0
     assert control.rewards["track_linear_velocity"].weight > 0
     assert cfg.rewards["speed_forward"].weight == control.rewards["speed_forward"].weight == 12
-    assert cfg.rewards["air_time"].weight == control.rewards["air_time"].weight == 6
+    assert cfg.rewards["air_time"].weight == 3 and control.rewards["air_time"].weight == 6
+
+
+@pytest.mark.parametrize("before_profile,after_profile,name,initial,target", (
+    ("A1", "C1", "air_time", 6, 3),
+))
+def test_successive_profiles_change_only_named_reward_and_endpoint(
+    source, before_profile, after_profile, name, initial, target,
+):
+    baseline, selected = source
+    control = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
+                                                 reward_profile=before_profile)
+    candidate = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
+                                                   reward_profile=after_profile)
+    before, after = rewards._config_data(control), rewards._config_data(candidate)
+    assert before["rewards"]["track_linear_velocity"]["weight"] == after["rewards"]["track_linear_velocity"]["weight"] == 0
+    assert before["rewards"][name]["weight"] == initial
+    assert after["rewards"][name]["weight"] == target
+    after["rewards"][name]["weight"] = initial
+    targets = after["curriculum"]["speed_rewards"]["params"]["targets"]
+    if name in targets:
+        assert tuple(targets[name]) == (target, target)
+        targets[name] = before["curriculum"]["speed_rewards"]["params"]["targets"][name]
+    assert before == after
+    assert experiments.reward_overrides("B1") == {"air_time": 3.0}
+    assert experiments.reward_overrides("B2") == {"speed_forward": 18.0}

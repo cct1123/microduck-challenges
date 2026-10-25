@@ -136,9 +136,10 @@ def markdown_report(report):
                      f"{format(anchor, '.6g') if anchor is not None else 'missing'} | "
                      f"{format(mean, '.6g') if mean is not None else 'missing'} |")
     lines.extend(["", f"Mean episode return at anchor: {report['mean_reward']['at_iteration']:.6g}",
-                  "", report["verdict"], "", "## Independent weight candidates (not combined)",
-                  "", "A0: unchanged control. A1: linear tracking -> 0. "
-                  "B1: air time -> 3. B2: course speed -> 18.",
+                  "", report["verdict"], "", "## Explicit reward profiles", "",
+                  "A0: unchanged control. A1: linear tracking -> 0. "
+                  "B1: air time -> 3. B2: course speed -> 18. "
+                  "C1: linear tracking -> 0 AND air time -> 3; compared with A1 only air time changes.",
                   "These are unvalidated experiments; select by legal finish time and completion, not larger reward."])
     return "\n".join(lines) + "\n"
 

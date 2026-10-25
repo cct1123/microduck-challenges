@@ -485,7 +485,8 @@ def main():
     parser.add_argument("action", choices=("plan", "run", "smoke", "assess"))
     parser.add_argument("--phase", choices=("explore", "exploit"), default="explore")
     parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default=None,
-                        help="A0 control, A1 no linear tracking, B1 less air time, B2 stronger speed (not combined)")
+                        help="A0 control; A1 tracking off; B1 air time 3; B2 speed 18; "
+                             "C1 tracking off + air time 3")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--promotion", type=Path)
     parser.add_argument("--iterations", type=int)

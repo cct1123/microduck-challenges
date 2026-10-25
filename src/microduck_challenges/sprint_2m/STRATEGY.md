@@ -2,7 +2,7 @@
 
 ## Opt-in reward experiments and plateau audit
 
-The next Workshop/train run defaults to **A1**, selected explicitly by
+The next Workshop/train run defaults to **C1**, selected explicitly by
 `training.reward_profile` in `challenge.toml`. Campaign plan/run/smoke use the
 same default. The `--reward-profile` option selects one explicitly named recipe:
 
@@ -12,10 +12,13 @@ same default. The `--reward-profile` option selects one explicitly named recipe:
 | `A1` | `track_linear_velocity` weight -> 0 |
 | `B1` | `air_time` weight -> 3; does NOT include A1 |
 | `B2` | `speed_forward` weight -> 18; does NOT include A1 or B1 |
+| `C1` | Explicit combination: tracking -> 0 AND air time -> 3; only air time differs from A1 |
 
-These are unvalidated hypotheses, not demonstrated speed gains. First compare
-A0/A1 from the same exact source and matched transition budgets. Do not combine
-weight changes or infer a gain from a larger total reward. Source metadata and
+C1 was compared against A1 from the same retained model_8250 with the same
+seed 2, 2,048 environments and 500-update budget. Air-time weight 6 -> 3 is its
+ONLY reward change relative to A1; forward-speed weight remains 12. B1/B2 keep
+their original independent semantics. Do not infer a gain from a larger total
+reward. Source metadata and
 checkpoint markers are validated against an independently built source recipe
 BEFORE target overrides; applicable curriculum endpoints are frozen so resets
 cannot undo the experiment. Saved agent configuration and `.pt` files record the
@@ -26,7 +29,7 @@ exploration/assessment, not an old approval applied to a new reward.
 The CLI is non-launching without the existing explicit `run --execute` switch:
 
 ```bash
-uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile A1
+uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C1
 ```
 
 `--reward-profile A0` selects the unchanged control. An explicit
@@ -42,6 +45,25 @@ The completed `2026-10-24_17-22-58_run-1024-1722` was A0, not A1: its saved
 tracking weight stayed 0.4927176. Its best Workshop result was 1.208 s at
 checkpoint 0; the final checkpoint scored 1.272 s, with reliability regressions
 at intermediate checkpoints. That run did not test A1.
+
+The later A1 GPU run `2026-10-24_18-07-46_explore-A1-s2-20261024-180704`
+completed all 500 updates with unchanged source files. All 11 checkpoints were
+evaluated: best was model_0, 1.212 s and 5/5, while model_499 scored 11.008 s
+with 4/5 finishes. The source is not replaced by the failed final model. Over
+iterations 479–499, logged air-time contribution averaged 4.671 versus speed
+6.542 (about 71%). This motivates testing lower air-time weight, not a claim
+that air time is the proven cause or that C1 is already faster.
+
+The completed C1 GPU run `2026-10-24_19-47-22_explore-C1-s2-20261024-194631`
+also finished 500 updates with unchanged source files and 11/11 results. Best
+reliable was model_50 (tied with model_150), 1.220 s, 5/5; final model_499 was
+1.256 s, 5/5. Only 6/11 C1 checkpoints finished 5/5, versus 8/11 for A1. These
+variable-command sweep scores do not establish improved reliability or speed.
+Over iterations 479–499, C1's weighted air-time contribution was 2.263 versus
+A1's 4.671, but weighted speed was essentially unchanged (6.508 versus 6.542).
+Lower air-time weight did not produce a clear racing gain. Keep model_8250;
+these results do not authorize promotion or another GPU run. The dense
+20-second training objective is still not exact minimum race-time optimization.
 
 Read existing logs without inference, rollout or training:
 
@@ -82,7 +104,7 @@ smoke/export check in a fresh directory:
 
 ```bash
 uv run --group workshop python -m microduck_challenges.sprint_2m.campaign smoke \
-  --phase explore --reward-profile A1 --output logs/verification/my-a1-smoke
+  --phase explore --reward-profile C1 --output logs/verification/my-c1-smoke
 ```
 
 This verifies software/restore/export only, not improved racing performance.

@@ -8,6 +8,7 @@ REWARD_PROFILES = {
     "A1": {"track_linear_velocity": 0.0},
     "B1": {"air_time": 3.0},
     "B2": {"speed_forward": 18.0},
+    "C1": {"track_linear_velocity": 0.0, "air_time": 3.0},
 }
 
 
