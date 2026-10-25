@@ -56,24 +56,25 @@ def test_profile_changes_only_named_weight_and_cannot_reramp(source, profile):
     assert control.rewards["pose"].weight == 0
 
 
-def test_profile_source_is_independently_validated_and_marker_bound(source):
+@pytest.mark.parametrize("profile", ("A1", "C2"))
+def test_profile_source_is_independently_validated_and_marker_bound(source, profile):
     baseline, selected = source
     candidate = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
-                                                   reward_profile="A1")
+                                                   reward_profile=profile)
     selected["source_env"] = rewards._config_data(candidate)
-    selected["source_agent"]["algorithm"]["reward_profile"] = "A1"
+    selected["source_agent"]["algorithm"]["reward_profile"] = profile
     with pytest.raises(ValueError, match="saved reward profile"):
         rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected)
     torch.save({"infos": {"env_state": {"common_step_counter": 222648}},
-                "sprint_reward_profile": "A1"}, selected["path"])
+                "sprint_reward_profile": profile}, selected["path"])
     before = promotion.digest(selected["path"])
     result = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
-                                                reward_profile="A1")
+                                                reward_profile=profile)
     assert result.rewards["track_linear_velocity"].weight == 0
     selected["source_env"]["rewards"]["heading_hold"]["weight"] = 0
     with pytest.raises(ValueError, match="Invalid source reward weight"):
         rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
-                                            reward_profile="A1")
+                                            reward_profile=profile)
     assert promotion.digest(selected["path"]) == before
 
 
@@ -195,9 +196,9 @@ def test_scoring_and_launch_defaults_fail_closed(tmp_path, monkeypatch):
 
 def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypatch):
     _, selected = source
-    assert env.STAGE_SETTINGS["reward_profile"] == "C1"
+    assert env.STAGE_SETTINGS["reward_profile"] == "C2"
     default = experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine")
-    assert default == "C1"
+    assert default == "C2"
     assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine", "A0") == "A0"
     assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "baseline") == "A0"
     with pytest.raises(ValueError, match="strict refinement"):
@@ -208,12 +209,13 @@ def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypat
     control = env.make_env_cfg(stage="refine", reward_profile="A0")
     assert cfg.rewards["track_linear_velocity"].weight == 0
     assert control.rewards["track_linear_velocity"].weight > 0
-    assert cfg.rewards["speed_forward"].weight == control.rewards["speed_forward"].weight == 12
+    assert cfg.rewards["speed_forward"].weight == 18 and control.rewards["speed_forward"].weight == 12
     assert cfg.rewards["air_time"].weight == 3 and control.rewards["air_time"].weight == 6
 
 
 @pytest.mark.parametrize("before_profile,after_profile,name,initial,target", (
     ("A1", "C1", "air_time", 6, 3),
+    ("C1", "C2", "speed_forward", 12, 18),
 ))
 def test_successive_profiles_change_only_named_reward_and_endpoint(
     source, before_profile, after_profile, name, initial, target,

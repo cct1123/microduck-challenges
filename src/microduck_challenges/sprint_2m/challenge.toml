@@ -33,7 +33,7 @@ max   = 6.0
 [training]
 stage = "refine"
 phase = "explore"
-reward_profile = "C1"      # A1 plus air-time 6 -> 3; only air time differs from A1
+reward_profile = "C2"      # C1 plus course-speed 12 -> 18; other rewards unchanged
 
 [training.phases.explore]
 max_iterations = 500

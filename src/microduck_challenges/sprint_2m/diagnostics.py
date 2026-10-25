@@ -139,7 +139,8 @@ def markdown_report(report):
                   "", report["verdict"], "", "## Explicit reward profiles", "",
                   "A0: unchanged control. A1: linear tracking -> 0. "
                   "B1: air time -> 3. B2: course speed -> 18. "
-                  "C1: linear tracking -> 0 AND air time -> 3; compared with A1 only air time changes.",
+                  "C1: linear tracking -> 0 AND air time -> 3; compared with A1 only air time changes. "
+                  "C2: C1 plus course speed -> 18; compared with C1 only speed weight changes.",
                   "These are unvalidated experiments; select by legal finish time and completion, not larger reward."])
     return "\n".join(lines) + "\n"
 

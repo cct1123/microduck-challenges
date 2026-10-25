@@ -2,7 +2,7 @@
 
 ## Opt-in reward experiments and plateau audit
 
-The next Workshop/train run defaults to **C1**, selected explicitly by
+The next Workshop/train run defaults to **C2**, selected explicitly by
 `training.reward_profile` in `challenge.toml`. Campaign plan/run/smoke use the
 same default. The `--reward-profile` option selects one explicitly named recipe:
 
@@ -13,12 +13,15 @@ same default. The `--reward-profile` option selects one explicitly named recipe:
 | `B1` | `air_time` weight -> 3; does NOT include A1 |
 | `B2` | `speed_forward` weight -> 18; does NOT include A1 or B1 |
 | `C1` | Explicit combination: tracking -> 0 AND air time -> 3; only air time differs from A1 |
+| `C2` | C1 plus course-speed weight -> 18; only speed weight differs from C1 |
 
-C1 was compared against A1 from the same retained model_8250 with the same
-seed 2, 2,048 environments and 500-update budget. Air-time weight 6 -> 3 is its
-ONLY reward change relative to A1; forward-speed weight remains 12. B1/B2 keep
-their original independent semantics. Do not infer a gain from a larger total
-reward. Source metadata and
+These are hypotheses, not demonstrated speed gains. C2 is prepared, not yet GPU
+trained. Its comparison restarts from the same retained model_8250 and keeps
+C1's seed 2, 2,048 environments and 500-update budget. Course-speed weight
+12 -> 18 is its ONLY reward change relative to C1: tracking remains 0, air time
+remains 3, and heading, upright, safety, physics and PPO controls are unchanged.
+B1/B2 keep their original independent semantics. Do not infer a gain from a
+larger total reward. Source metadata and
 checkpoint markers are validated against an independently built source recipe
 BEFORE target overrides; applicable curriculum endpoints are frozen so resets
 cannot undo the experiment. Saved agent configuration and `.pt` files record the
@@ -29,7 +32,7 @@ exploration/assessment, not an old approval applied to a new reward.
 The CLI is non-launching without the existing explicit `run --execute` switch:
 
 ```bash
-uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C1
+uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C2
 ```
 
 `--reward-profile A0` selects the unchanged control. An explicit
@@ -61,9 +64,12 @@ reliable was model_50 (tied with model_150), 1.220 s, 5/5; final model_499 was
 variable-command sweep scores do not establish improved reliability or speed.
 Over iterations 479–499, C1's weighted air-time contribution was 2.263 versus
 A1's 4.671, but weighted speed was essentially unchanged (6.508 versus 6.542).
-Lower air-time weight did not produce a clear racing gain. Keep model_8250;
-these results do not authorize promotion or another GPU run. The dense
-20-second training objective is still not exact minimum race-time optimization.
+Lower air-time weight did not produce a clear racing gain. C2 tests stronger
+course-speed incentive without weakening safety terms or changing the speed
+function/vel_ref. This dense 20-second objective is still not exact race-time
+optimization; neither a larger reward nor C2's CPU smoke can validate the
+hypothesis. Keep model_8250 and compare legal times and completion before any
+promotion. No new GPU run is authorized by preparing these rewards.
 
 Read existing logs without inference, rollout or training:
 
@@ -104,7 +110,7 @@ smoke/export check in a fresh directory:
 
 ```bash
 uv run --group workshop python -m microduck_challenges.sprint_2m.campaign smoke \
-  --phase explore --reward-profile C1 --output logs/verification/my-c1-smoke
+  --phase explore --reward-profile C2 --output logs/verification/my-c2-smoke
 ```
 
 This verifies software/restore/export only, not improved racing performance.
