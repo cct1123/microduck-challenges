@@ -1,190 +1,140 @@
-# Hill Climb: bootstrap first, refine only verified Hill policies
+# Hill Climb H1: bounded exploration, not promotion
 
-This transfers Sprint's **software/selection discipline**, not a demonstrated
-faster hill gait. No compatible trained Hill checkpoint was available when this
-was implemented. Sprint checkpoints, mature reward endpoints and its unproven
-C1 combination are **not** Hill starting points.
+## Ordinary Workshop / train defaults
 
-## Two distinct entry points
+The selected next recipe is **refine / explore / H1**, 500 new PPO updates,
+2048 environments, checkpoint interval 50, seed 1, fixed learning rate 0.00005,
+entropy 0.01, clip 0.2 and learned Gaussian std scale 1.0. There is no automatic
+switch to exploitation, retry, promotion, publication or incumbent replacement.
+The campaign wrapper has a 40-minute wall cap; ordinary Workshop/raw `train`
+shares the recipe but does not inherit that wrapper watchdog or launch lock.
+Nothing in this change authorizes a run. The user has forbidden smoke tests,
+rollouts, training, real export and pushes; only the reviewed, scoped local
+implementation and documentation commits are authorized.
 
-| | Bootstrap (default Workshop / `train`) | Refinement explore | Refinement exploit |
-|---|---:|---:|---:|
-| Start | Random weights | Explicit compatible Hill `.pt`, official 5/5 | Exact candidate approved by paired assessment |
-| New updates (maximum) | 3000 | 500 | 500 |
-| Environments | 4096 | 2048 | 2048 |
-| Save interval | 250 | 50 | 50 |
-| Learning rate | 0.001, adaptive | 0.00005, fixed | 0.00001, fixed |
-| Entropy / PPO clip | 0.01 / 0.2 | 0.01 / 0.2 | 0.001 / 0.1 |
-| Noise | Original initialization | Restored noise × relative scale 1 | Restored noise × relative scale 0.5 |
-| Wrapper training wall cap | 180 minutes | 40 minutes | 40 minutes |
+`training.refine` pins exactly:
 
-One invocation is one bounded run; there is **no automatic switch, retry,
-promotion, incumbent replacement or publication**. `plan` and `run` without
-`--execute` only print a plan. Planning is not authorization to train.
+`logs/rsl_rl/hill_climb_1m5/2026-10-24_23-10-03_run-1024-2309/model_1000.pt`
 
-Bootstrap retains the original hill rewards, beginner curricula and domain
-randomization. Generated heightfield terrain, 8–15° slope knob (default 10°),
-30/50 solver, heading_hold, critic-only heading_error, robot/BAM actuators,
-14 un-clipped actions and ordered 61D actor / 77D critic remain intact. Commands
-still cover the complete straight 0.15–1.00 m/s sweep; head/body command slots
-remain present. There are no new reward formulas, broad physics changes, course
-speed terms, lean relaxations or leg-freedom changes in this adaptation.
+SHA256 `799ed0b452a1a484b4f700362248779fe127a1ba821a2c545728cdf9c9e814b9`.
+Saved environment, agent, provenance and Workshop result hashes are also pinned.
+There is no latest-run glob and no cold-start fallback. Missing/tampered inputs
+fail closed. Bootstrap remains explicitly available with
+`MICRODUCK_HILL_STAGE=bootstrap`, using live Workshop knobs and the original
+beginner curricula/optimizer. This is also the portable unit-collection override
+on clean clones without the local source archive.
 
-Refinement rejects missing or foreign checkpoints instead of cold-starting. It
-checks the literal filename, Hill task/provenance, ordered layouts, full robot,
-physics/terrain/reward/curriculum configuration, actor/critic architectures,
-both normalizers and all state tensor shapes/finiteness, saved profile/noise
-markers, runner iteration and environment age. Loads inspect tensors on CPU.
-Only known runtime terrain hydration (world count and generated sub-patch size)
-is normalized; arbitrary terrain changes are rejected.
+## Exact exploratory-source exception
 
-Refinement loads the complete actor/critic and normalizers, starts fresh Adam
-and runner numbering, and retains the real environment clock. Its curricula are
-frozen at the source's age-appropriate stages, **not blindly at mature endpoints**.
-The frozen curriculum clock is recorded separately and inherited unchanged by
-refinement descendants; installed strict `step > threshold` boundaries are
-preserved. Phase noise scaling applies to restored learned Gaussian deviations,
-not mean actions, `init_std` or mechanical limits, and does not compound when
-continuing the same scale. `MICRODUCK_WARM_START`'s upstream clock reset is refused.
+The real checkpoint has **3/5 finishes**, failure-penalized official mean
+**25.872 s at command 0.75 m/s**, not a reliable 5/5 result. Raw seed rows:
+1 finishes 3.14 s; 2 falls; 3 falls; 4 finishes 3.12 s; 5 finishes 3.10 s.
+Each fall contributes 60 seconds. All five available checkpoints from this
+stopped bootstrap were evaluated: 0/250 score 60 s (0/5), 500 scores 49.164 s
+(1/5), 750 scores 48.784 s (1/5), 1000 scores 25.872 s (3/5).
 
-## Independent, explicitly Hill-local reward hypotheses
+The user explicitly approved **model_1000 for exploration only**. That exception
+is restricted to this exact path, checkpoint hash, four metadata/result hashes,
+3/5 raw result and explore phase. It is not a global lowering of source or
+promotion gates. Every other training source still needs consistent official
+5/5 evidence. Exploitation still requires a 5/5 source and an approved exact
+promotion report, preserving its reward profile. The partial-source marker
+cannot be removed to bypass this restriction.
 
-A0 is the safe default for all entry points. Experiments require strict refinement:
+## Source recipe before H1
 
-- **A0:** unchanged Hill reward recipe, frozen at the source stage.
-- **A1:** only `track_linear_velocity` weight → 0.
-- **B1:** only `air_time` weight → 1.5 (Hill control is 3). It does **not** include A1.
+The source's provenance names clean commit `6ecf44903`. Its saved configuration
+and that commit's TOML independently agree on these original construction inputs:
 
-These are hypotheses, not proven gains. B1's Hill coefficient deliberately differs
-from Sprint's namesake; unsupported C1/B2 are refused. Source recipe/profile is
-validated independently **before** applying a target override, and matching
-curriculum endpoints are frozen. Exploitation must retain the approved source's
-profile; a changed reward requires new exploration and assessment. Larger training
-return is not evidence of a faster legal hill finish. Episode reward terms and
-last-100 completed episode returns use different accounting/windows; inspect the
-logged reward mass, not just coefficients, before proposing more ablations.
+| Knob | Saved source | Current live bootstrap knob (not H1 baseline) |
+|---|---:|---:|
+| Linear velocity tracking weight | 3.95619419642857 | 5.0 |
+| Upright weight | 2.0 | 1.00167410714286 |
+| Air time weight | 6.0 | 6.0 |
+| Maximum generated slope | 10 degrees | 10 degrees |
 
-## Commands
+Refinement reconstructs and validates the entire source recipe with those pinned
+inputs before target overrides; it does not treat today's edited knobs as old
+training history or rewrite archived metadata. Only known runtime terrain
+hydration, world count and seed differences are normalized. Descendants persist
+original construction inputs, source pins, phase, H1 parameters and ramp origin
+in saved agent configuration and checkpoint markers, and strictly revalidate
+these identities. Missing or contradictory H1 markers/parameters are refused.
 
-Run at the repository root. The separate, currently edited Sprint recipe can
-require archived Sprint files during package registration; the portable commands
-below explicitly keep that unrelated task in baseline mode. Hill's own default
-does not search for archives.
+The real source environment clock is **24024**, with runner checkpoint iteration
+1000 (1001 completed 24-step batches). Full actor/critic tensors and both running
+normalizers are restored strictly, without architecture migration: 61D actor,
+77D critic and 14 actions. Adam and runner numbering start fresh. Actual
+environment age is retained; bootstrap curriculum stages freeze at the separate
+source clock, not at mature endpoints. Here action-rate weight is -0.6,
+head-bias weight 2.0 and standing fraction 0.15. `MICRODUCK_WARM_START` is refused
+because upstream would reset the environment clock.
 
-```bash
-export MICRODUCK_SPRINT_STAGE=baseline
+## H1 reward hypothesis (unvalidated performance)
 
-# Non-launching; original bootstrap optimization, not a 500-update refinement.
-uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign plan
+A0, A1 (only linear tracking off) and B1 (only air time 1.5) keep their meanings.
+H1 intentionally combines two changes, relative to the frozen actual source:
 
-# Required before ANY training, including a CPU smoke.
-uv run --group workshop pytest tests/test_hill_lite.py
-uv run --group workshop pytest
+1. Add `horizontal_forward_speed`, weight **5.0**, returning the signed bounded
+   value `alpha * tanh(v_horizontal_spawn_heading / 1.0 m/s)`. Reverse motion is
+   negative, not a positive speed-magnitude reward. This uses true body linear
+   velocity, not wheels/joints or commanded speed. The coefficient is a modest
+   starting hypothesis alongside existing source tracking 3.956 and air time 6;
+   it is not an experimentally selected optimum.
+2. Keep upright weight **2.0**, upright optimum and baseline gravity-component
+   variance **0.05**. Relax only positive-gravity-x (nose-down) pitch variance
+   toward **0.30**, blended continuously with *actual positive forward motion*,
+   reaching full configured allowance **by 0.1 m/s**. This is tolerance, not a
+   forced lean angle or a changed joint limit. Roll, backward pitch, stationary
+   and reverse motion retain baseline tolerance. No global upright weakening.
 
-# Exactly two CPU environments and two 24-step updates; explicit seed, fresh path.
-# Tests must pass first. Both custom and installed Workshop/publish exports are
-# checked against the saved actor + normalizer, with finite CPU 61→14 parity.
-uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign smoke \
-  --seed 4 --output /absolute/new/output-directory
+Both changes share `alpha`: zero through the first **50 new updates**, then a
+linear **200-update ramp**, reaching full effect at new update 250 within the
+500-update screen. Origin is the real source clock, not zero or an inherited
+mature bootstrap schedule; H1 descendants inherit that origin rather than
+restarting the ramp. Rewards are computed from the live clock, so no manager
+weight mutation can silently jump the schedule.
 
-# Later, only after a REAL compatible Hill checkpoint has a consistent 5/5 result:
-uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign plan \
-  --stage refine --phase explore --source /absolute/Hill/run/model_N.pt --reward-profile A0
+The frame is explicitly **horizontal spawn-heading projection**. Generated Hill
+training terrain contains pyramids and flat spawn platforms: the robot travels
+down, up and across slopes. This is not along-slope race distance, nor a copied
+fixed 8-degree course vector. Existing heading hold and critic heading error
+remain intact. H1 positive payouts are suppressed on nonfinite root state or
+more than 60-degree tilt. An independent Arena-style >60-degree held-0.3-second
+termination is added; the original hard fall termination is not loosened.
 
-# Optional refinement software smoke still requires the genuine source above.
-uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign smoke \
-  --stage refine --source /absolute/Hill/run/model_N.pt --seed 4 --output /absolute/new/refine-smoke
+Robot/BAM/joint mechanics, unclipped scale-1 actions, solver 30/50, terrain,
+maximum slope, command sweep, actor/critic ordering, head/body slots, head EMA,
+and all other source rewards are unchanged except the explicit curriculum freeze.
 
-# After Workshop has judged EVERY checkpoint, freeze a command BEFORE assessment.
-# --source is the retained incumbent to beat, not a candidate selected on held-outs.
-uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign assess \
-  --run logs/rsl_rl/hill_climb_1m5/COMPLETE_RUN \
-  --source /absolute/Hill/incumbent/model_N.pt --command 0.55 \
-  --output /absolute/new/assessment-directory
+## Verification and limits
 
-# A passing assessment enables planning this EXACT candidate/profile, not publishing:
-uv run --group workshop python -m microduck_challenges.hill_climb_1m5.campaign plan \
-  --stage refine --phase exploit --promotion /absolute/assessment-directory/assessment.json
-```
+The current preparation is **unit-only**. It checks real Tyro parsing of plain
+Workshop/train defaults and planned CLI arguments, then loads the real model on
+CPU through the registered installed runner using an in-memory fake environment
+(no physics). It checks exact actor/critic/normalizer tensors, both clocks, fresh
+Adam, source/profile markers, ramp/frame/sign behavior, stationary/reverse/roll/
+backpitch, nonfinite/deep-fall suppression, held-fall/reset and source/parameter
+corruption. Portable tests explicitly request bootstrap instead of importing an
+archive-dependent default. Shared/other-challenge tests are preserved.
 
-`run ... --output NEW_DIRECTORY --execute` is the separately authorized launch
-form. It reruns tests and CPU smoke under an exclusive local launch lock, refuses
-concurrent recognized trainers, then uses the recognized `mjlab.scripts.train`
-entry point on GPU 0 so installed provenance recording works. The watchdog
-terminates/reaps only its own child process group on budget, termination signals
-or post-spawn errors. Source/config hashes are checked before and after training.
-It does not submit paid jobs, stop pre-existing jobs, commit, push or publish.
-Raw Workshop/`train` uses the bootstrap recipe but does **not** inherit the
-wrapper's watchdog/lock; arbitrary CLI overrides are not a bounded campaign.
+Evidence: `logs/verification/hill-h1-explore/REPORT.md` and `verification.json`.
+The guarded tracked suite excludes all smoke-named tests, two true Arena tests
+and the true-child launcher test. It fails unexpected simulation/training/
+installed-official-export boundaries. No smoke, rollout, optimization step,
+installed real export, Arena race, training launch, push or performance
+improvement is claimed. Scoped local commits are backed by guarded unit-only
+snapshot verification, not runtime validation. The existing campaign launch
+preflight still invokes a smoke and must not be used while the user's smoke ban
+remains in force.
 
-New bounded campaigns save an absolute launch-journal path and deterministic
-plan digest in **both** `params/agent.yaml` and every checkpoint. The digest
-covers the immutable plan (task, source/manifest hashes, budgets, seed, stage,
-profile and run name), not mutable PID/state fields. Source validation checks
-these independent bindings before any target reward override. Assessment and
-exploitation require the exact linked journal to be terminal `completed`, exit
-zero, with both unchanged-source flags true and every frozen artifact still
-matching. Missing/partial/mismatched bindings, tampered plans, running/failed
-journals and `source_changed_not_promotable` are rejected; no log-directory scan
-or caller-supplied optional journal can bypass the veto. Ordinary Workshop/
-`train` checkpoints with both metadata fields absent/None remain supported and
-are not retroactively claimed to have bounded-launch provenance.
+## Promotion gate (unchanged)
 
-## Assessment gates
-
-1. Reconcile **every** expected checkpoint using the saved budget/cadence,
-   including checkpoint 0 and the final update; require a consistent Workshop
-   result for every file. Missing/corrupt/contradictory results block assessment.
-2. Freeze one valid sweep command explicitly before any fresh assessment races.
-   Export each actor to a new directory outside source runs/Workshop caches and
-   check finite CPU ONNX/Torch parity, `[1,61] → [1,14]`, and the 64 MiB limit.
-3. Screen every checkpoint on seeds 1–5. Require three adjacent entries in the
-   **unfiltered complete inventory** to each finish 5/5. Never skip failed neighbors.
-4. Select exactly the fastest development mean in a stable window; persist its
-   identity/hashes **before opening held-outs**. A failed candidate does not trigger
-   testing another candidate against those same held-outs.
-5. Compare that candidate and the explicitly retained incumbent at the same command
-   on paired seeds 6–25. Require candidate 20/20, strictly faster development mean,
-   and held-out failure-penalized mean no worse than incumbent. Every fall/timeout
-   counts **60 seconds**, never a dropped row.
-6. Recompute approval from complete raw rows, bind reports to their persisted JSONL,
-   exports/checkpoints/config hashes, event/evaluator/version signature and unchanged
-   inventory. Record exact linked journal/plan/frozen-manifest hashes, recheck at
-   assessment start/end and again before exploitation. An `approved=true` field
-   by itself authorizes nothing; a launcher's source-change veto stays binding.
-
-Held-outs can lose independence through repeated reuse. Passing this software
-gate is neither a statistical guarantee, an Arena leaderboard result nor physical
-robot validation. A first bootstrap has no incumbent yet: inspect all its official
-scores and explicitly retain an initial compatible 5/5 policy; it does not
-self-promote. Assessment/refinement remain blocked if such evidence is absent.
-
-## Verification and deliberate limits
-
-Real bootstrap CPU training/export evidence is under
-`logs/verification/hill-strategy-20261024/`: two environments/two updates, seed 4,
-61D actor / 77D critic, 49 live reward checks, finite TensorBoard values and eight
-CPU ONNX parity cases. Unit tests use generated local fixtures, not invented
-training/evaluation results; they cover strict restore, independent profiles,
-source/layout/clock rejection, score integrity, adjacency, locks and owned-child
-cleanup. Shared tests and the seven pre-existing dirty Sprint files are preserved.
-
-There was no genuine reliable Hill source, so no end-to-end trained refinement,
-real paired Arena assessment, long/GPU training or racing improvement is claimed.
-The untrained smoke checkpoint is **not** installed as an incumbent or given
-fabricated 5/5 evidence. Bootstrap must first learn a reliable hill gait.
-
-The standard smoke now also invokes installed
-`mjlab_microduck.export.run_export(ExportConfig(device="cpu", num_envs=1, ...))`
-on its newly saved final checkpoint, writing a separate `official.onnx`. Both
-exports must produce finite `[1,61] → [1,14]` outputs matching the saved Torch
-actor/normalizer on eight inputs, and the official artifact must also match the
-validated custom export. `smoke.json` records both hashes and parity errors.
-This uses the registered play-only actor restore, never training restoration or
-a 5/5 gate on the untrained new checkpoint. A refinement smoke still requires
-genuine 5/5 evidence for its **input** source. Negative normalizer deviations
-are rejected on every loading/export path; legitimate zero variance is allowed.
-
-The latest correction verification is unit-only at the user's request: the new
-standard-smoke/official-export integration has not been executed. No new rollout,
-training, publication or racing-performance result is claimed.
+Reconcile every expected saved checkpoint/result; freeze one valid command
+before fresh assessment. Require three adjacent entries in the unfiltered
+inventory each to finish 5/5; select the fastest once, then compare with the
+retained incumbent on paired held-out seeds 6–25. Require candidate 20/20,
+strictly faster development mean and no worse failure-penalized held-out mean.
+Every failure counts 60 s. Bind approval to exact raw rows/artifact hashes and
+completed, unchanged campaign provenance where present. Approval is not a
+leaderboard result or physical-robot validation. No assessment was run here.
