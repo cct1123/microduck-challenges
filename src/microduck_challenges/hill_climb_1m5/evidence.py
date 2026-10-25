@@ -29,6 +29,86 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def plan_digest(plan):
+    """Immutable launch identity, independent of mutable journal state/PID."""
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def campaign_evidence(checkpoint, agent=None, payload=None):
+    """Resolve only the exact checkpoint/config-bound journal; legacy runs stay valid."""
+    import torch
+    from .learning import TASK, read_config
+
+    checkpoint = Path(checkpoint).resolve()
+    if agent is None:
+        agent = read_config(checkpoint.parent / "params/agent.yaml")
+    if payload is None:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    fields = ("campaign_journal", "campaign_plan_digest")
+    binding = tuple(agent["algorithm"].get(key) for key in fields)
+    marker = tuple(payload.get("hill_" + key) for key in fields)
+    if all(value is None for value in (*binding, *marker)):
+        return None  # Explicitly supported ordinary Workshop/train checkpoints.
+    if (not all(isinstance(value, str) and value for value in (*binding, *marker))
+            or binding != marker or not Path(binding[0]).is_absolute()
+            or not re.fullmatch(r"[0-9a-f]{64}", binding[1])):
+        raise ValueError("Invalid or mismatched Hill campaign binding")
+    journal_path, identity = binding
+    try:
+        journal = read_report(journal_path)
+        plan = journal["plan"]
+        if journal.get("plan_digest") != identity or plan_digest(plan) != identity:
+            raise ValueError("Hill campaign plan identity changed")
+        if (journal.get("state") != "completed" or journal.get("exit_code") != 0
+                or journal.get("source_files_unchanged") is not True
+                or journal.get("source_artifacts_unchanged") is not True):
+            raise ValueError("Hill campaign must be completed with unchanged source")
+        command = plan["command"]
+        def argument(flag):
+            if command.count(flag) != 1:
+                raise ValueError("Invalid Hill campaign launch command")
+            return command[command.index(flag) + 1]
+        algorithm = agent["algorithm"]
+        expected = {"--agent.max-iterations": str(plan["max_iterations"]),
+                    "--agent.seed": str(plan["seed"]),
+                    "--agent.save-interval": str(plan["controls"]["save_interval"]),
+                    "--env.scene.num-envs": str(plan["controls"]["num_envs"])}
+        if (command[1:4] != ["-m", "mjlab.scripts.train", TASK]
+                or any(argument(flag) != value for flag, value in expected.items())
+                or agent["max_iterations"] != plan["max_iterations"]
+                or agent["seed"] != plan["seed"]
+                or agent["save_interval"] != plan["controls"]["save_interval"]
+                or agent["run_name"] != argument("--agent.run-name")
+                or algorithm.get("stage", "bootstrap") != plan["stage"]
+                or algorithm.get("reward_profile", "A0") != plan["reward_profile"]
+                or algorithm.get("source_clock", 0) != plan["source_clock"]
+                or any(plan["environment"].get("MICRODUCK_HILL_" + key.upper()) != plan[key]
+                       for key in ("stage", "phase", "reward_profile"))):
+            raise ValueError("Hill campaign launch identity disagrees with saved agent")
+        saved_env = read_config(checkpoint.parent / "params/env.yaml")
+        provenance = read_report(checkpoint.parent / "provenance.json")
+        if (saved_env["scene"]["num_envs"] != plan["controls"]["num_envs"]
+                or provenance.get("task") != TASK or provenance.get("seed") != plan["seed"]):
+            raise ValueError("Hill campaign task/seed/environment identity changed")
+        frozen = {**plan["source_files"], **plan["source_config_files"]}
+        if not plan["source_files"] or any(digest(path) != value for path, value in frozen.items()):
+            raise ValueError("Hill campaign frozen source/manifest changed")
+        return {"journal": journal_path, "plan_digest": identity,
+                "journal_sha256": digest(journal_path), "frozen_hashes": frozen}
+    except (OSError, KeyError, TypeError, IndexError) as error:
+        raise ValueError("Missing or malformed Hill campaign journal/manifest") from error
+
+
+def campaign_snapshots(checkpoints):
+    snapshots = {}
+    for checkpoint in checkpoints:
+        evidence = campaign_evidence(checkpoint)
+        if evidence is not None:
+            snapshots[str(Path(checkpoint).resolve())] = evidence
+    return snapshots
+
+
 def saved_checkpoints(run):
     """Detect missing checkpoints using the saved budget and checkpoint cadence."""
     import yaml
@@ -168,6 +248,10 @@ def require_promotion(report_path, source, gate):
         raise ValueError("Promotion report does not approve this exact source checkpoint")
     if Path(source).name != f"model_{report['candidate_checkpoint']}.pt":
         raise ValueError("Promotion checkpoint identifier does not match the source artifact")
+    checkpoints = [*(Path(source).resolve().parent / f"model_{n}.pt" for n in report["checkpoints"]),
+                   Path(report["incumbent_path"]).resolve()]
+    if campaign_snapshots(checkpoints) != report.get("campaign_evidence", {}):
+        raise ValueError("Hill campaign evidence changed or was omitted from assessment")
     decision = promotion_decision(report, gate)
     verify_raw_rows(report, Path(report_path).resolve().parent)
     if not decision["approved"]:
@@ -200,6 +284,8 @@ def require_promotion(report_path, source, gate):
     for path, expected in artifacts.items():
         if digest(path) != expected:
             raise ValueError(f"Assessment artifact changed: {path}")
+    if campaign_snapshots(checkpoints) != report.get("campaign_evidence", {}):
+        raise ValueError("Hill campaign evidence changed during promotion validation")
     return report
 
 

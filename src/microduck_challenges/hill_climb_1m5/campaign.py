@@ -19,13 +19,15 @@ from typing import Any, cast
 
 from . import env as hill_env
 from .learning import (TASK, LOG_ROOT, HillPpoCfg, REWARD_PROFILES, config_data, read_config,
-                       phase_settings, refinement_recipe, reward_overrides, validate_source)
+                       phase_settings, refinement_recipe, reward_overrides, validate_source,
+                       validate_normalized_state)
 from .evidence import (digest, promotion_decision, read_report, require_promotion,
-                       runtime_signature, saved_checkpoints, summarize, validate_command)
+                       runtime_signature, saved_checkpoints, summarize, validate_command,
+                       campaign_snapshots, plan_digest)
 
 
 def smoke(stage="bootstrap", phase="explore", source=None, output=None, reward_profile="A0", seed=None):
-    """Exactly two CPU envs/two updates, live-clock checks and finite ONNX parity.
+    """Two CPU envs/two updates, live clocks and custom + official ONNX parity.
 
     A refinement smoke still needs a genuine compatible 5/5 hill source; an
     untrained smoke checkpoint is not forged into race evidence.
@@ -149,13 +151,17 @@ def smoke(stage="bootstrap", phase="explore", source=None, output=None, reward_p
     if not scalars or not all(math.isfinite(v) for v in scalars) or (source and digest(source) != before):
         raise ValueError("Nonfinite smoke scalars or changed source")
     export = export_actor(log_dir / "model_1.pt", output / "verified.onnx")
+    official_export = export_official_actor(log_dir / "model_1.pt", output / "official.onnx",
+                                           output / "verified.onnx")
+    if source and digest(source) != before:
+        raise ValueError("Smoke source changed during official export")
     report = {"stage": stage, "phase": phase, "reward_profile": reward_profile,
               "device": "cpu", "seed": seed, "environments": 2, "updates": 2,
               "observations": observations, "source": str(source) if source else None,
               "source_clock": source_clock, "final_environment_clock": source_clock + 48,
               "runner_iteration": final["iter"], "restored_state_tensors": restored_tensors,
               "live_reward_checks": live_checks, "reward_weights": expected_weights,
-              "finite_scalar_values": len(scalars), "export": export,
+              "finite_scalar_values": len(scalars), "export": export, "official_export": official_export,
               "provenance": str(log_dir / "provenance.json"), "racing_performance_verified": False}
     write_json(output / "smoke.json", report)
     return report
@@ -242,18 +248,13 @@ def write_json(path, data):
     temporary.replace(path)
 
 
-def export_actor(checkpoint, output):
-    """Strictly export the saved actor, never the current critic or Workshop cache."""
-    import numpy as np
-    import onnxruntime as ort
+def _saved_actor(checkpoint):
+    """Strict saved actor/normalizer reconstruction shared by both parity checks."""
     import torch
     from rsl_rl.models import MLPModel
     from tensordict import TensorDict
 
-    checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
-    if output.exists():
-        raise ValueError("Preserve previous exports: choose a new assessment directory")
-    before = digest(checkpoint)
+    checkpoint = Path(checkpoint).resolve()
     agent = read_config(checkpoint.parent / "params/agent.yaml")
     if read_report(checkpoint.parent / "provenance.json").get("task") != TASK:
         raise ValueError("Export only a saved Hill actor")
@@ -269,8 +270,7 @@ def export_actor(checkpoint, output):
     for old, new in (("std", "distribution.std_param"), ("log_std", "distribution.log_std_param")):
         if old in state:
             state[new] = state.pop(old)
-    if any(not torch.isfinite(value).all() for value in state.values()):
-        raise ValueError("Nonfinite saved actor state")
+    validate_normalized_state(state)
     actor = MLPModel(TensorDict({"actor": torch.zeros(1, 61)}, batch_size=[1]),
                      {"actor": ["actor"]}, "actor", 14,
                      hidden_dims=actor_cfg["hidden_dims"], activation=actor_cfg["activation"],
@@ -278,15 +278,21 @@ def export_actor(checkpoint, output):
                      distribution_cfg=deepcopy(actor_cfg["distribution_cfg"]))
     actor.load_state_dict(state, strict=True)
     wrapper = cast(Any, actor.eval().as_onnx(verbose=False).cpu().eval())
-    output.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(wrapper, wrapper.get_dummy_inputs(), str(output), export_params=True,
-                      opset_version=18, input_names=wrapper.input_names,
-                      output_names=wrapper.output_names, dynamic_axes={}, dynamo=False)
+    return wrapper, reward_profile
+
+
+def _verify_onnx(wrapper, output, reference=None):
+    import numpy as np
+    import onnxruntime as ort
+    import torch
+
     session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    comparator = ort.InferenceSession(str(reference), providers=["CPUExecutionProvider"]) if reference else None
     if output.stat().st_size > 64 * 1024 * 1024:
         raise ValueError("Hill export exceeds the Arena 64 MiB limit")
     if session.get_inputs()[0].shape != [1, 61] or session.get_outputs()[0].shape != [1, 14]:
         raise ValueError("Export violated the Arena 61/14 contract")
+    maximum_error = 0.
     for seed in range(8):
         obs = np.random.default_rng(seed).normal(0, 0.05, (1, 61)).astype(np.float32)
         obs[0, 5], obs[0, 48] = -1, 0.3
@@ -296,12 +302,67 @@ def export_actor(checkpoint, output):
         if not np.isfinite(actual).all():
             raise ValueError("Nonfinite exported action")
         np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=3e-5)
+        maximum_error = max(maximum_error, float(np.max(np.abs(actual - expected))))
+        if comparator:
+            other = np.asarray(comparator.run(None, {"obs": obs})[0])
+            np.testing.assert_allclose(actual, other, rtol=2e-4, atol=3e-5)
+    return {"onnx_sha256": digest(output), "parity_cases": 8,
+            "input_shape": [1, 61], "output_shape": [1, 14], "max_abs_error": maximum_error}
+
+
+def export_actor(checkpoint, output):
+    """Strictly export the saved actor, never the current critic or Workshop cache."""
+    import torch
+
+    checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
+    if output.exists():
+        raise ValueError("Preserve previous exports: choose a new assessment directory")
+    before = digest(checkpoint)
+    wrapper, reward_profile = _saved_actor(checkpoint)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(wrapper, wrapper.get_dummy_inputs(), str(output), export_params=True,
+                      opset_version=18, input_names=wrapper.input_names,
+                      output_names=wrapper.output_names, dynamic_axes={}, dynamo=False)
+    verified = _verify_onnx(wrapper, output)
     if digest(checkpoint) != before:
         raise ValueError("Source checkpoint changed during export")
-    return {"checkpoint_sha256": before, "onnx_sha256": digest(output), "parity_cases": 8,
+    return {**verified, "checkpoint_sha256": before,
             "reward_profile": reward_profile,
+            "source_agent_sha256": digest(checkpoint.parent / "params/agent.yaml")}
+
+
+def export_official_actor(checkpoint, output, reference):
+    """Exercise the installed play runner, then compare real ONNX to saved Torch."""
+    import torch
+    from mjlab_microduck.export import ExportConfig, run_export
+
+    checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
+    if output.exists():
+        raise ValueError("Preserve previous official exports: choose a new output")
+    before = digest(checkpoint)
+    wrapper, profile = _saved_actor(checkpoint)
+    previous_cuda, previous_threads = os.environ.get("CUDA_VISIBLE_DEVICES"), torch.get_num_threads()
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    torch.set_num_threads(2)
+    try:
+        result = run_export(TASK, ExportConfig(checkpoint_file=str(checkpoint),
+                            onnx_file=str(output), device="cpu", num_envs=1))
+        if (result.onnx_path.resolve() != output
+                or result.checkpoint_path is None or result.checkpoint_path.resolve() != checkpoint):
+            raise ValueError("Official exporter returned the wrong artifact/source")
+        verified = _verify_onnx(wrapper, output, reference)
+    finally:
+        torch.set_num_threads(previous_threads)
+        if previous_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = previous_cuda
+    if digest(checkpoint) != before:
+        raise ValueError("Source checkpoint changed during official export")
+    return {**verified, "checkpoint_sha256": before, "reward_profile": profile,
             "source_agent_sha256": digest(checkpoint.parent / "params/agent.yaml"),
-            "input_shape": [1, 61], "output_shape": [1, 14]}
+            "exporter": "mjlab_microduck.export.run_export", "device": "cpu",
+            "reference_onnx_sha256": digest(reference)}
 
 
 def inventory(run):
@@ -336,6 +397,8 @@ def assess(run, incumbent, output, command_vx):
     validate_command(command_vx)
     ids = inventory(run)
     incumbent = selected_source(incumbent)["path"]
+    checkpoints = [*(run / f"model_{n}.pt" for n in ids), incumbent]
+    campaigns = campaign_snapshots(checkpoints)
     if output == run or run in output.parents or incumbent.parent == output or incumbent.parent in output.parents:
         raise ValueError("Assessment output must be separate from source runs")
     output.mkdir(parents=True, exist_ok=False)
@@ -344,6 +407,9 @@ def assess(run, incumbent, output, command_vx):
     model = compile_course(manifest)
     command = manifest.command_at(gate["command_vx"])
     artifacts = {}
+    for campaign in campaigns.values():
+        artifacts[campaign["journal"]] = campaign["journal_sha256"]
+        artifacts.update(campaign["frozen_hashes"])
     for number in ids:
         official = run / "workshop" / f"model_{number}.json"
         artifacts[str(official)] = digest(official)
@@ -355,7 +421,8 @@ def assess(run, incumbent, output, command_vx):
         artifacts[str(path)] = digest(path)
     report = {"schema": 1, "status": "screening", "gate": gate, "checkpoints": ids,
               "incumbent_path": str(incumbent), "screen": {}, "exports": {},
-              "artifact_hashes": artifacts, "runtime": runtime_signature()}
+              "artifact_hashes": artifacts, "runtime": runtime_signature(),
+              "campaign_evidence": campaigns}
 
     def races(checkpoint, label, seeds, partition="screen"):
         validate_source(checkpoint, hill_env.make_env_cfg(stage="bootstrap"), hill_env.BASE_RL_CFG, require_result=False)
@@ -402,6 +469,8 @@ def assess(run, incumbent, output, command_vx):
                                     + races(incumbent, "incumbent", range(first, first + size), "heldout"))
         report["status"] = "complete"
         report["decision"] = promotion_decision(report, gate)
+    if campaign_snapshots(checkpoints) != campaigns:
+        raise ValueError("Hill campaign evidence changed during assessment")
     if (inventory(run) != ids or any(digest(path) != value for path, value in artifacts.items())
             or report["runtime"] != runtime_signature()):
         raise ValueError("Assessment inputs changed; promotion is forbidden")
@@ -490,10 +559,13 @@ def _run_bounded(plan, output):
     if (any(digest(p) != value for p, value in plan.get("source_config_files", {}).items())
             or any(digest(p) != value for p, value in plan["source_files"].items())):
         raise ValueError("Source checkpoint or scripts changed during preflight")
-    journal = {"plan": plan, "state": "reserved", "pid": None}
+    identity = plan_digest(plan)
+    journal = {"plan": plan, "plan_digest": identity, "state": "reserved", "pid": None}
     write_json(output / "run.json", journal)
     with (output / "training.log").open("w") as stream, _termination_requests() as stop:
-        environment = {**os.environ, **plan["environment"]}
+        environment = {**os.environ, **plan["environment"],
+                       "MICRODUCK_HILL_CAMPAIGN_JOURNAL": str(output / "run.json"),
+                       "MICRODUCK_HILL_CAMPAIGN_PLAN_DIGEST": identity}
         environment.pop("MICRODUCK_WARM_START", None)
         process = None
         try:

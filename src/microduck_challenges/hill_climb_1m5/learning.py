@@ -42,6 +42,15 @@ def read_config(path):
     return yaml.load(Path(path).read_text(), Loader=ConfigLoader)
 
 
+def validate_normalized_state(state):
+    """Shared finite-state contract; constant commands may have zero variance."""
+    if not state or not all(torch.isfinite(value).all() for value in state.values()):
+        raise ValueError("Nonfinite Hill model state")
+    std = state.get("obs_normalizer._std")
+    if std is not None and (std < 0).any():
+        raise ValueError("Invalid Hill normalizer standard deviation")
+
+
 def verify_model_state(payload, agent):
     """Validate exact native 61D/77D hill MLPs, including both normalizers."""
     from rsl_rl.models import MLPModel
@@ -56,16 +65,14 @@ def verify_model_state(payload, agent):
                              activation=cfg["activation"], obs_normalization=cfg["obs_normalization"],
                              distribution_cfg=deepcopy(cfg["distribution_cfg"]))
             state = dict(payload[f"{name}_state_dict"])
+            validate_normalized_state(state)
             if name == "actor" and "std" in state:
                 state["distribution.std_param"] = state.pop("std")
             try:
                 model.load_state_dict(state, strict=True)
             except RuntimeError as error:
                 raise ValueError(f"Hill requires full compatible {name} state and normalizer") from error
-            # Constant Arena commands legitimately have zero variance; the
-            # installed normalizer divides by std + eps, not std alone.
-            if (state["obs_normalizer._std"] < 0).any():
-                raise ValueError("Invalid Hill normalizer standard deviation")
+
 
 
 def reward_overrides(profile):
@@ -133,13 +140,21 @@ class HillPpoCfg(PpoWithSymmetryCfg):
     source_clock: int = 0
     curriculum_clock: int = 0
     exploration_std_scale: float = 1.0
+    campaign_journal: str | None = None
+    campaign_plan_digest: str | None = None
+
+
+def mark_actor_only_inference(env, env_ids=None):
+    """Explicit play/export marker, never inferred from load flags or shapes."""
+    del env_ids
+    env._hill_inference_only = True
 
 
 class HillPPO(PPO):
     """Strict full hill warm start; fresh Adam/runner clock, retained env clock."""
 
     def __init__(self, *args, stage="bootstrap", reward_profile="A0", source_clock=0, curriculum_clock=0,
-                 exploration_std_scale=1.0, **kwargs):
+                 exploration_std_scale=1.0, campaign_journal=None, campaign_plan_digest=None, **kwargs):
         reward_overrides(reward_profile)
         if stage not in ("bootstrap", "refine") or (stage == "bootstrap" and reward_profile != "A0"):
             raise ValueError("Hill bootstrap requires A0; unknown stages are refused")
@@ -147,6 +162,7 @@ class HillPPO(PPO):
         self.curriculum_clock = curriculum_clock
         self.exploration_std_scale = self._noise(exploration_std_scale)
         self._restored = False
+        self.campaign_journal, self.campaign_plan_digest = campaign_journal, campaign_plan_digest
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -157,9 +173,26 @@ class HillPPO(PPO):
 
     def save(self):
         return {**super().save(), "hill_reward_profile": self.reward_profile,
-                "hill_exploration_std_scale": self.exploration_std_scale}
+                "hill_exploration_std_scale": self.exploration_std_scale,
+                "hill_campaign_journal": getattr(self, "campaign_journal", None),
+                "hill_campaign_plan_digest": getattr(self, "campaign_plan_digest", None)}
+
+    @staticmethod
+    def construct_algorithm(obs, env, cfg, device):
+        algorithm = PPO.construct_algorithm(obs, env, cfg, device)
+        setattr(algorithm, "_hill_inference_only", bool(
+            getattr(getattr(env, "unwrapped", env), "_hill_inference_only", False)))
+        return algorithm
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
+        if getattr(self, "_hill_inference_only", False):
+            if not strict:
+                raise ValueError("Hill inference requires a strict full actor restore")
+            state = loaded_dict["actor_state_dict"]
+            validate_normalized_state(state)
+            # No refinement clocks, noise rescaling, critic or optimizer in play.
+            return super().load(loaded_dict, {"actor": True, "critic": False,
+                                "optimizer": False, "iteration": False, "rnd": False}, strict=True)
         if self.stage == "bootstrap":
             raise ValueError("Bootstrap is from scratch; use explicit Hill refinement, not resume")
         required = {"actor": True, "critic": True, "optimizer": False, "iteration": False, "rnd": False}
@@ -172,8 +205,7 @@ class HillPPO(PPO):
         if clock != self.source_clock or type(clock) is not int or clock <= 0:
             raise ValueError("Hill source environment clock changed")
         for name in ("actor_state_dict", "critic_state_dict"):
-            if not all(torch.isfinite(v).all() for v in loaded_dict[name].values()):
-                raise ValueError("Nonfinite Hill state")
+            validate_normalized_state(loaded_dict[name])
         result = super().load(loaded_dict, required, strict=True)
         factor = self._noise(self.exploration_std_scale) / self._noise(loaded_dict.get("hill_exploration_std_scale", 1.0))
         if factor != 1:
@@ -185,6 +217,8 @@ class HillPPO(PPO):
         return result
 
     def train_mode(self):
+        if getattr(self, "_hill_inference_only", False):
+            raise RuntimeError("The actor-only Hill play/export model is inference-only.")
         if self.stage == "refine" and not self._restored:
             raise RuntimeError("Hill refinement cannot train without its strict source restore")
         super().train_mode()
@@ -192,7 +226,7 @@ class HillPPO(PPO):
 
 def validate_source(path, baseline, agent, *, require_result=True):
     """Pin an exact Hill source, independently validate its declared recipe first."""
-    from .evidence import read_report, summarize
+    from .evidence import campaign_evidence, read_report, summarize
 
     if path is None:
         raise ValueError("Hill refinement requires an explicit hill source")
@@ -251,6 +285,7 @@ def validate_source(path, baseline, agent, *, require_result=True):
         if saved_agent[name] != wanted_agent[name]:
             raise ValueError(f"Incompatible Hill {name}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    campaign_evidence(path, saved_agent, payload)
     if payload.get("hill_reward_profile", "A0") != profile:
         raise ValueError("Checkpoint and saved reward profile disagree")
     clock = (payload.get("infos") or {}).get("env_state", {}).get("common_step_counter")

@@ -133,7 +133,7 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
-from .learning import HillPpoCfg, phase_settings, refinement_recipe, validate_source
+from .learning import HillPpoCfg, mark_actor_only_inference, phase_settings, refinement_recipe, validate_source
 
 TRAINING = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
 RECIPE = challenge.load(__file__).recipe
@@ -807,6 +807,9 @@ def make_env_cfg(
     cfg.sim.mujoco.ls_iterations = 50  # was 20
 
     if play:
+        cfg.events["actor_only_inference"] = EventTermCfg(
+            func=mark_actor_only_inference, mode="startup",
+        )
         cfg.scene.terrain.terrain_generator.curriculum = False
         cfg.scene.terrain.terrain_generator.num_cols = 5
         cfg.scene.terrain.terrain_generator.num_rows = 5
@@ -1006,3 +1009,12 @@ if TRAINING_STAGE == "refine":
         "curriculum_clock": _selected["curriculum_clock"],
         "schedule": "fixed", **{k: _controls[k] for k in
             ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale")}})
+
+# Bounded launch injects these before task registration; ordinary Workshop runs
+# explicitly retain None. BASE_RL_CFG stays unbound for source reconstruction.
+_campaign_journal = os.environ.get("MICRODUCK_HILL_CAMPAIGN_JOURNAL")
+_campaign_plan_digest = os.environ.get("MICRODUCK_HILL_CAMPAIGN_PLAN_DIGEST")
+if (_campaign_journal is None) != (_campaign_plan_digest is None):
+    raise ValueError("Incomplete Hill campaign launch binding")
+RL_CFG.algorithm = HillPpoCfg(**{**asdict(RL_CFG.algorithm),
+    "campaign_journal": _campaign_journal, "campaign_plan_digest": _campaign_plan_digest})
