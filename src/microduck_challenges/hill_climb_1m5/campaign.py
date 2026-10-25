@@ -29,8 +29,8 @@ from .evidence import (digest, promotion_decision, read_report, require_promotio
 def smoke(stage="bootstrap", phase="explore", source=None, output=None, reward_profile="A0", seed=None):
     """Two CPU envs/two updates, live clocks and custom + official ONNX parity.
 
-    A refinement smoke still needs a genuine compatible 5/5 hill source; an
-    untrained smoke checkpoint is not forged into race evidence.
+    Refinement uses the same strict source gate (or exact explore-only exception);
+    an untrained smoke checkpoint is never forged into race evidence.
     """
     import torch
     import mjlab.scripts.train as train
@@ -45,7 +45,7 @@ def smoke(stage="bootstrap", phase="explore", source=None, output=None, reward_p
         raise ValueError("Unknown Hill smoke stage/phase")
     if stage == "bootstrap" and (source or phase != "explore" or reward_profile != "A0"):
         raise ValueError("Bootstrap smoke is from scratch, explore/A0 only")
-    selected = selected_source(source) if stage == "refine" else None
+    selected = selected_source(source, phase=phase) if stage == "refine" else None
     source_clock = selected["clock"] if selected else 0
     source = selected["path"] if selected else None
     before = digest(source) if source else None
@@ -58,13 +58,9 @@ def smoke(stage="bootstrap", phase="explore", source=None, output=None, reward_p
     cfg = replace(train.TrainConfig.from_task(TASK), gpu_ids=None,
                   env=hill_env.make_env_cfg(stage="bootstrap"), agent=deepcopy(hill_env.BASE_RL_CFG))
     if selected:
-        controls = phase_settings(hill_env.TRAINING, phase)
-        cfg = replace(cfg, env=refinement_recipe(cfg.env, selected["curriculum_clock"], reward_profile))
-        cfg.agent.algorithm = HillPpoCfg(**{**asdict(cfg.agent.algorithm),
-            "stage": "refine", "reward_profile": reward_profile, "source_clock": source_clock,
-            "curriculum_clock": selected["curriculum_clock"],
-            "schedule": "fixed", **{k: controls[k] for k in
-                ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale")}})
+        cfg = replace(cfg, env=refinement_recipe(hill_env.make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]),
+                          selected["curriculum_clock"], reward_profile, reward_origin=selected["reward_origin"]))
+        cfg.agent.algorithm = hill_env.refinement_algorithm(selected, phase, reward_profile)
         (output / source.parent.name).symlink_to(source.parent, target_is_directory=True)
         cfg.agent.resume = True
         cfg.agent.load_run = "^" + re.escape(source.parent.name) + "$"
@@ -167,12 +163,14 @@ def smoke(stage="bootstrap", phase="explore", source=None, output=None, reward_p
     return report
 
 
-def selected_source(source=None):
-    return validate_source(source, hill_env.make_env_cfg(stage="bootstrap"), hill_env.BASE_RL_CFG)
+def selected_source(source=None, *, phase="exploit"):
+    return hill_env.selected_training_source(source, phase=phase)
 
 
-def make_plan(stage="bootstrap", phase="explore", source=None, promotion_path=None,
-              iterations=None, seed=None, reward_profile="A0"):
+def make_plan(stage=None, phase="explore", source=None, promotion_path=None,
+              iterations=None, seed=None, reward_profile=None):
+    stage = hill_env.TRAINING["stage"] if stage is None else stage
+    reward_profile = (hill_env.TRAINING["reward_profile"] if stage == "refine" else "A0") if reward_profile is None else reward_profile
     overrides = reward_overrides(reward_profile)
     selected = None
     environment = {"MICRODUCK_HILL_STAGE": stage, "MICRODUCK_HILL_PHASE": phase,
@@ -191,7 +189,7 @@ def make_plan(stage="bootstrap", phase="explore", source=None, promotion_path=No
         controls = phase_settings(hill_env.TRAINING, phase)
         if promotion_path and source is None:
             source = read_report(promotion_path)["candidate_path"]
-        selected = selected_source(source)
+        selected = selected_source(source, phase=phase)
         source = selected["path"]
         environment["MICRODUCK_HILL_SOURCE"] = str(source)
         if phase == "exploit":
@@ -204,7 +202,8 @@ def make_plan(stage="bootstrap", phase="explore", source=None, promotion_path=No
             environment["MICRODUCK_HILL_PROMOTION"] = str(Path(promotion_path).resolve())
         elif promotion_path:
             raise ValueError("Promotion is only meaningful for exploitation")
-        target = refinement_recipe(hill_env.make_env_cfg(stage="bootstrap"), selected["curriculum_clock"], reward_profile)
+        target = refinement_recipe(hill_env.make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]),
+                                   selected["curriculum_clock"], reward_profile, reward_origin=selected["reward_origin"])
     else:
         raise ValueError("Unknown Hill stage")
     budget = controls["max_iterations"]
@@ -229,6 +228,9 @@ def make_plan(stage="bootstrap", phase="explore", source=None, promotion_path=No
     if promotion_path:
         artifacts[str(Path(promotion_path).resolve())] = digest(promotion_path)
     return {"stage": stage, "phase": phase, "reward_profile": reward_profile,
+            "source_identity": selected["source_identity"] if selected else None,
+            "target_algorithm": asdict(hill_env.refinement_algorithm(selected, phase, reward_profile)) if selected else asdict(hill_env.BASE_RL_CFG.algorithm),
+            "target_reward_parameters": {n: config_data(target)["rewards"][n]["params"] for n in ("upright", "horizontal_forward_speed") if n in target.rewards},
             "reward_overrides": overrides, "source": str(source) if source else None,
             "source_clock": selected["clock"] if selected else 0,
             "source_config_files": artifacts, "max_iterations": iterations, "seed": seed,
@@ -605,9 +607,9 @@ def _run_bounded(plan, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "run", "smoke", "assess"))
-    parser.add_argument("--stage", choices=("bootstrap", "refine"), default="bootstrap")
+    parser.add_argument("--stage", choices=("bootstrap", "refine"), default=hill_env.TRAINING["stage"])
     parser.add_argument("--phase", choices=("explore", "exploit"), default="explore")
-    parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default="A0")
+    parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES))
     parser.add_argument("--source", type=Path)
     parser.add_argument("--promotion", type=Path)
     parser.add_argument("--iterations", type=int)
@@ -627,7 +629,8 @@ def main():
         elif args.action == "smoke":
             if not args.output or args.seed is None:
                 parser.error("smoke requires a new --output directory and explicit --seed")
-            print(json.dumps(smoke(args.stage, args.phase, args.source, args.output, args.reward_profile, args.seed), indent=2))
+            profile = args.reward_profile or (hill_env.TRAINING["reward_profile"] if args.stage == "refine" else "A0")
+            print(json.dumps(smoke(args.stage, args.phase, args.source, args.output, profile, args.seed), indent=2))
         else:
             plan = make_plan(args.stage, args.phase, args.source, args.promotion,
                              args.iterations, args.seed, args.reward_profile)

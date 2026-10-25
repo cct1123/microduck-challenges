@@ -4,17 +4,34 @@ event = "hill-climb-1m5"
 task  = "Mjlab-HillClimb1m5-MicroDuck"
 kind  = "perpetual"
 
-[recipe]                  # the first training, as is
+[recipe]                  # next bounded exploration; bootstrap remains explicit
 num_envs       = 2048
 max_iterations = 500
 seed           = 1
 
 # Bootstrap keeps the original beginner curriculum and optimization recipe.
-# Refinement is a separate explicit launch, never an automatic phase switch.
+# H1 exploration is selected explicitly below, never an automatic phase switch.
 [training]
-stage = "bootstrap"
-reward_profile = "A0"
+stage = "refine"
+reward_profile = "H1"
 bootstrap_wall_minutes = 180
+
+# Explicit user exception: this 3/5 policy may seed exploration ONLY.
+# Its source recipe is reconstructed independently, before any H1 override.
+[training.refine]
+source = "logs/rsl_rl/hill_climb_1m5/2026-10-24_23-10-03_run-1024-2309/model_1000.pt"
+sha256 = "799ed0b452a1a484b4f700362248779fe127a1ba821a2c545728cdf9c9e814b9"
+env_sha256 = "9d3c78e38075c64d0e00f48a1c7489e65bbda3b999fb0315e1dd3dcee0453b67"
+agent_sha256 = "cd9b6ef25b4155d86f1d7c35023bc2aba5164bdd31c12280b537f2a261910155"
+provenance_sha256 = "8bc46a919424626d502f1f17c9f55ae1a1508d45cbf10ebc1d613f88eee06670"
+result_sha256 = "bca6ac805265d2a91e13207cf58f6223305eaa5d1ee2f40c83ae7c0727a4ab03"
+partial_exception = "model1000-3of5-exploration-only"
+
+[training.refine.base_knobs]
+forward_reward = 3.95619419642857
+upright_reward = 2.0
+step_reward = 6.0
+max_slope_deg = 10.0
 
 [training.phases.explore]
 max_iterations = 500

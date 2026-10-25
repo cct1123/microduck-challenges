@@ -11,10 +11,212 @@ import yaml
 from microduck_challenges.hill_climb_1m5 import env
 
 
-def test_default_is_real_from_scratch_bootstrap_and_preserves_hill_contract():
+def test_h1_adds_ramped_signed_speed_and_only_forward_motion_lean_tolerance():
+    from microduck_challenges.hill_climb_1m5 import learning
+    cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24024, "H1")
+    assert cfg.rewards["horizontal_forward_speed"].weight == 5.
+    assert cfg.rewards["upright"].weight == env.make_env_cfg(stage="bootstrap").rewards["upright"].weight
+    assert cfg.rewards["upright"].params["forward_variance"] == .30
+    assert cfg.rewards["upright"].params["motion_speed"] == .1
+    assert cfg.rewards["upright"].params["origin_step"] == 24024
+    from microduck_challenges.hill_climb_1m5 import rewards
+    assert cfg.terminations["arena_held_fall"].func is rewards.ArenaTiltGuard
+    raw = _motion_fixture(pitch=20.)
+    raw.common_step_counter = 24024
+    speed, upright = cfg.rewards["horizontal_forward_speed"], cfg.rewards["upright"]
+    assert speed.func(raw, **speed.params).item() == 0.
+    baseline = torch.exp(-raw.scene["robot"].data.projected_gravity_b[:, :2].square().sum(-1) / .05)
+    torch.testing.assert_close(upright.func(raw, **upright.params), baseline)
+    raw.common_step_counter += 250 * 24
+    assert 0 < speed.func(raw, **speed.params).item() < 1
+    forward = upright.func(raw, **upright.params)
+    assert forward.item() > baseline.item()
+    for motion in (0., -.1):
+        raw.scene["robot"].data.root_link_lin_vel_w[:, 0] = motion
+        torch.testing.assert_close(upright.func(raw, **upright.params), baseline)
+    raw.scene["robot"].data.root_link_lin_vel_w[:, 0] = -.1
+    assert speed.func(raw, **speed.params).item() < 0
+    for pose in ({"pitch": -20.}, {"roll": 20.}):
+        raw = _motion_fixture(**pose)
+        raw.common_step_counter = 30000
+        baseline = torch.exp(-raw.scene["robot"].data.projected_gravity_b[:, :2].square().sum(-1) / .05)
+        torch.testing.assert_close(upright.func(raw, **upright.params), baseline)
+
+
+def test_approved_partial_source_is_exact_pinned_exploration_only(monkeypatch):
+    from microduck_challenges.hill_climb_1m5 import learning
+    source = Path("logs/rsl_rl/hill_climb_1m5/2026-10-24_23-10-03_run-1024-2309/model_1000.pt")
+    if not source.exists():
+        pytest.skip("Local real source archive is not available on portable clones")
+    selected = env.selected_training_source(source, phase="explore")
+    assert selected["partial_exception"] == "model1000-3of5-exploration-only"
+    assert selected["clock"] == selected["curriculum_clock"] == 24024
+    assert selected["base_knobs"]["upright_reward"] == 2.
+    assert selected["base_knobs"]["forward_reward"] == 3.95619419642857
+    target = env.make_env_cfg(stage="refine", reward_profile="H1", source=source)
+    assert target.rewards["upright"].weight == 2.
+    assert target.rewards["track_linear_velocity"].weight == 3.95619419642857
+    assert target.rewards["head_pose_bias"].weight == 2.
+    assert target.rewards["action_rate_l2"].weight == -.6
+    with pytest.raises(ValueError, match="5/5|exploration"):
+        env.selected_training_source(source, phase="exploit")
+    with pytest.raises(ValueError, match="5/5"):
+        learning.validate_source(source, env.make_env_cfg(stage="bootstrap", knobs=selected["base_knobs"]), env.BASE_RL_CFG)
+    bad = deepcopy(env.TRAINING["refine"])
+    bad["sha256"] = "0" * 64
+    monkeypatch.setitem(env.TRAINING, "refine", bad)
+    with pytest.raises(ValueError, match="pin|exception"):
+        env.selected_training_source(source, phase="explore")
+
+
+def test_plain_workshop_tyro_defaults_restore_the_real_h1_source_without_simulation():
+    import json
+    import os
+    import subprocess
+    import sys
+    source = Path("logs/rsl_rl/hill_climb_1m5/2026-10-24_23-10-03_run-1024-2309/model_1000.pt")
+    if not source.exists():
+        pytest.skip("Real source archive is local, not a portable fixture")
+    code = '''
+import json, torch, tyro, mjlab
+from dataclasses import asdict
+from types import SimpleNamespace
+from tensordict import TensorDict
+from mjlab.scripts.train import TrainConfig
+from mjlab.tasks.registry import load_runner_cls
+from microduck_challenges.hill_climb_1m5 import env, learning, campaign
+# The parser/runner subprocess is guarded too: no simulator or real exporter.
+import mujoco, mjlab.envs, mjlab.scripts.train, mjlab_microduck.export, arena.runner
+def denied(*a, **kw):
+ raise AssertionError("forbidden runtime boundary in parser/runner unit check")
+for name in ("mj_step", "mj_step1", "mj_step2"):
+ setattr(mujoco, name, denied)
+mjlab.envs.ManagerBasedRlEnv.__init__ = denied
+mjlab.scripts.train.run_train = denied
+mjlab_microduck.export.run_export = denied
+arena.runner.run_once = denied
+cfg = tyro.cli(TrainConfig, args=[], default=TrainConfig.from_task(learning.TASK), config=mjlab.TYRO_FLAGS)
+assert cfg.agent.resume and cfg.agent.algorithm.stage == "refine"
+assert cfg.agent.algorithm.reward_profile == "H1"
+assert cfg.agent.max_iterations == 500 and cfg.env.scene.num_envs == 2048
+assert cfg.agent.save_interval == 50 and cfg.agent.algorithm.learning_rate == .00005
+assert cfg.agent.algorithm.schedule == "fixed"
+source = cfg.agent.algorithm.source_identity["path"]
+obs = TensorDict({"actor": torch.zeros(1,61), "critic": torch.zeros(1,77)}, batch_size=[1])
+raw = SimpleNamespace(common_step_counter=0)
+wrapped = SimpleNamespace(unwrapped=raw, cfg=cfg.env, num_envs=1, num_actions=14, get_observations=lambda:obs)
+runner = load_runner_cls(learning.TASK)(wrapped, asdict(cfg.agent), device="cpu")
+runner.load(source, map_location="cpu")
+payload = torch.load(source, map_location="cpu", weights_only=False)
+count = 0
+for name in ("actor", "critic"):
+ for key, value in getattr(runner.alg,name).state_dict().items():
+  torch.testing.assert_close(value, payload[name+"_state_dict"][key], rtol=0, atol=0)
+  count += 1
+assert not runner.alg.optimizer.state and runner.current_learning_iteration == 0
+assert runner.env.unwrapped.common_step_counter == 24024
+assert runner.alg.curriculum_clock == 24024 and runner.alg.reward_origin == 24024
+runner.alg.train_mode()
+marker = runner.alg.save()["hill_training_contract"]
+assert marker["source_identity"]["partial_exception"] == "model1000-3of5-exploration-only"
+runner.alg.reward_parameters = {**runner.alg.reward_parameters, "motion_speed": .5}
+try:
+ runner.load(source, map_location="cpu")
+except ValueError as error:
+ assert "H1" in str(error)
+else:
+ raise AssertionError("tampered target H1 parameters accepted")
+runner.alg.reward_parameters["motion_speed"] = .1
+plan = campaign.make_plan()
+assert plan["stage"] == "refine" and plan["reward_profile"] == "H1"
+assert plan["source_identity"] == marker["source_identity"]
+parsed = tyro.cli(TrainConfig, args=plan["command"][4:], default=TrainConfig.from_task(learning.TASK), config=mjlab.TYRO_FLAGS)
+assert parsed.agent.resume and parsed.agent.algorithm.source_identity == marker["source_identity"]
+assert parsed.agent.algorithm.reward_profile == "H1" and parsed.gpu_ids == [0]
+import re
+assert re.fullmatch(parsed.agent.load_checkpoint, "model_1000.pt")
+assert not re.fullmatch(parsed.agent.load_checkpoint, "model_10000.pt")
+print("VERIFIED="+json.dumps({"tensors":count,"contract":marker,"weights":{n:t.weight for n,t in cfg.env.rewards.items()},"source_clock":raw.common_step_counter}))
+'''
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("MICRODUCK_HILL_")}
+    actual = subprocess.check_output([sys.executable, "-c", code], env={**clean, "MICRODUCK_SPRINT_STAGE": "baseline"}, text=True)
+    verified = json.loads(actual.split("VERIFIED=")[1])
+    assert verified["tensors"] > 20
+    assert verified["weights"]["upright"] == 2.
+
+
+def test_partial_identity_cannot_omit_exception_or_be_used_for_exploitation():
+    from microduck_challenges.hill_climb_1m5 import learning
+    source = Path(learning.APPROVED_PARTIAL["source"])
+    if not source.exists():
+        pytest.skip("Local real source archive absent")
+    identity = deepcopy(env.selected_training_source(source)["source_identity"])
+    identity["partial_exception"] = None
+    with pytest.raises(ValueError, match="exception|5/5"):
+        learning.verify_source_identity(identity)
+
+
+def test_h1_frames_ramp_boundaries_nonfinite_and_held_fall_reset():
+    from microduck_challenges.hill_climb_1m5 import learning, rewards
+    cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24, "H1")
+    speed, upright = cfg.rewards["horizontal_forward_speed"], cfg.rewards["upright"]
+    raw = _motion_fixture(pitch=20., yaw=90.)
+    raw._heading_ref[:] = torch.pi / 2
+    raw.scene["robot"].data.root_link_lin_vel_w[:] = torch.tensor([[0., .1, 4.]])
+    raw.common_step_counter = 24 + 50 * 24
+    assert speed.func(raw, **speed.params).item() == 0
+    raw.common_step_counter += 100 * 24
+    halfway = speed.func(raw, **speed.params)
+    raw.common_step_counter += 100 * 24
+    torch.testing.assert_close(speed.func(raw, **speed.params), 2 * halfway)
+    # Reset takes the new yaw, not a stale heading from the previous episode.
+    raw._heading_ref[:] = 0
+    raw.episode_length_buf[:] = 0
+    assert speed.func(raw, **speed.params).item() > 0
+    raw = _motion_fixture(pitch=61.)
+    raw.common_step_counter = 10000
+    guard = rewards.ArenaTiltGuard(None, raw)
+    assert speed.func(raw, **speed.params).item() == upright.func(raw, **upright.params).item() == 0
+    for _ in range(14):
+        assert not guard(raw).item()
+    assert guard(raw).item()
+    guard.reset(torch.tensor([0]))
+    assert not guard.failed.any() and not guard.steps.any()
+    raw.scene["robot"].data.root_link_quat_w[:] = torch.tensor([[1., 0., 0., 0.]])
+    assert not guard(raw).item()
+    guard.steps[:] = 7
+    assert not guard(raw).item() and not guard.steps.any()
+    for key in ("root_link_quat_w", "root_link_lin_vel_w"):
+        saved = getattr(raw.scene["robot"].data, key).clone()
+        getattr(raw.scene["robot"].data, key)[:, 0] = float("nan")
+        assert speed.func(raw, **speed.params).item() == upright.func(raw, **upright.params).item() == 0
+        setattr(raw.scene["robot"].data, key, saved)
+    # Full configuration differs ONLY by new speed, upright formula/params, held guard.
+    control = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24, "A0")
+    before, after = learning.config_data(control), learning.config_data(cfg)
+    after["rewards"].pop("horizontal_forward_speed")
+    after["rewards"]["upright"] = before["rewards"]["upright"]
+    after["terminations"].pop("arena_held_fall")
+    assert before == after
+
+
+def _motion_fixture(pitch=0., roll=0., yaw=0.):
+    import math
+    from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_apply_inverse
+    angles = [torch.tensor([math.radians(a)]) for a in (roll, pitch, yaw)]
+    quat = quat_from_euler_xyz(*angles)
+    gravity = quat_apply_inverse(quat, torch.tensor([[0., 0., -1.]]))
+    data = SimpleNamespace(root_link_quat_w=quat, projected_gravity_b=gravity,
+                           root_link_lin_vel_w=torch.tensor([[.1, 0., 0.]]))
+    return SimpleNamespace(scene={"robot": SimpleNamespace(data=data)},
+                           episode_length_buf=torch.tensor([2]), _heading_ref=torch.tensor([0.]),
+                           common_step_counter=0, num_envs=1, step_dt=.02, device="cpu")
+
+
+def test_explicit_bootstrap_preserves_live_knobs_and_original_hill_contract():
     cfg = env.make_env_cfg(stage="bootstrap")
     assert env.TRAINING_STAGE == "bootstrap"
-    assert env.RL_CFG.max_iterations == 3000 and not env.RL_CFG.resume
+    assert env.RL_CFG.max_iterations == env.RECIPE["max_iterations"] and not env.RL_CFG.resume
     assert env.RL_CFG.algorithm.learning_rate == 1e-3
     assert env.RL_CFG.algorithm.schedule == "adaptive"
     assert list(cfg.observations["actor"].terms) == [
@@ -35,6 +237,8 @@ def test_default_is_real_from_scratch_bootstrap_and_preserves_hill_contract():
 
 
 def test_refinement_is_explicit_hill_only_and_freezes_curricula(tmp_path, monkeypatch):
+    monkeypatch.setitem(env.TRAINING, "refine", {})
+    monkeypatch.delenv("MICRODUCK_HILL_SOURCE", raising=False)
     with pytest.raises(ValueError, match="explicit.*source"):
         env.make_env_cfg(stage="refine")
     with pytest.raises(ValueError, match="exact.*Hill"):
@@ -49,7 +253,8 @@ def test_independent_profiles_only_change_named_rewards_and_freeze_endpoints():
     assert control.rewards["head_pose_bias"].weight == 3
     assert control.commands["twist"].rel_standing_envs == .2
     assert control.events["randomize_com"].params["ranges"] == (-.015, .015)
-    for profile, overrides in learning.REWARD_PROFILES.items():
+    for profile in ("A0", "A1", "B1"):
+        overrides = learning.REWARD_PROFILES[profile]
         cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 36001, profile)
         before, after = learning.config_data(control), learning.config_data(cfg)
         for name, weight in overrides.items():
@@ -226,9 +431,9 @@ def test_smoke_api_is_available_without_a_checkpoint_or_launch_permission():
 
 def test_plan_is_nonlaunching_bootstrap_has_its_own_budget_and_no_archive(monkeypatch):
     from microduck_challenges.hill_climb_1m5 import campaign
-    plan = campaign.make_plan()
+    plan = campaign.make_plan(stage="bootstrap")
     assert plan["launching"] is False and plan["source"] is None
-    assert plan["max_iterations"] == 3000
+    assert plan["max_iterations"] == env.RECIPE["max_iterations"]
     assert plan["controls"]["num_envs"] == env.RECIPE["num_envs"]
     assert plan["command"][1:3] == ["-m", "mjlab.scripts.train"]
     import tyro
@@ -236,15 +441,17 @@ def test_plan_is_nonlaunching_bootstrap_has_its_own_budget_and_no_archive(monkey
     from mjlab.scripts.train import TrainConfig
     parsed = tyro.cli(TrainConfig, args=plan["command"][4:],
                       default=TrainConfig.from_task(campaign.TASK), config=mjlab.TYRO_FLAGS)
-    assert parsed.agent.max_iterations == 3000 and parsed.env.scene.num_envs == env.RECIPE["num_envs"]
+    assert parsed.agent.max_iterations == env.RECIPE["max_iterations"] and parsed.env.scene.num_envs == env.RECIPE["num_envs"]
     assert parsed.gpu_ids == [0] and not parsed.agent.resume
     assert parsed.agent.algorithm.stage == "bootstrap" and parsed.agent.algorithm.reward_profile == "A0"
+    monkeypatch.setitem(env.TRAINING, "refine", {})
+    monkeypatch.delenv("MICRODUCK_HILL_SOURCE", raising=False)
     with pytest.raises(ValueError, match="explicit.*source"):
         campaign.make_plan(stage="refine")
     with pytest.raises(ValueError, match="stage budget"):
-        campaign.make_plan(iterations=3001)
+        campaign.make_plan(stage="bootstrap", iterations=env.RECIPE["max_iterations"] + 1)
     with pytest.raises(ValueError, match="Bootstrap"):
-        campaign.make_plan(phase="exploit")
+        campaign.make_plan(stage="bootstrap", phase="exploit")
     monkeypatch.setattr(campaign, "active_trainers", lambda: [123])
     with pytest.raises(ValueError, match="trainer"):
         campaign.run_bounded({}, Path("must-not-create"))
@@ -410,6 +617,46 @@ def test_refinement_descendant_preserves_frozen_curriculum_not_just_age(hill_sou
     assert descendant.rewards["action_rate_l2"].weight == -.1
 
 
+def test_h1_descendant_contract_validates_origin_params_and_missing_markers(hill_source):
+    from dataclasses import asdict
+    from microduck_challenges.hill_climb_1m5 import learning
+    path, payload = hill_source
+    selected = env.selected_training_source(path)
+    algorithm = asdict(env.refinement_algorithm(selected, "explore", "H1"))
+    agent_path, cfg_path = path.parent / "params/agent.yaml", path.parent / "params/env.yaml"
+    # An ancestor identity must point at a separate immutable fixture, like a real warm start.
+    import shutil
+    ancestor = path.parent.with_name("ancestor")
+    shutil.copytree(path.parent, ancestor)
+    identity = algorithm["source_identity"]
+    identity["path"] = str(ancestor / path.name)
+    identity["artifacts"] = {str(ancestor / Path(k).relative_to(path.parent)): v for k, v in identity["artifacts"].items()}
+    agent = yaml.safe_load(agent_path.read_text())
+    agent["algorithm"] = algorithm
+    agent_path.write_text(yaml.safe_dump(agent, sort_keys=False))
+    cfg = learning.refinement_recipe(env.make_env_cfg(stage="bootstrap"), 24, "H1", reward_origin=24)
+    cfg_path.write_text(yaml.safe_dump(learning.config_data(cfg), sort_keys=False))
+    payload.update(hill_reward_profile="H1", hill_training_contract=learning.training_contract(algorithm))
+    payload["infos"]["env_state"]["common_step_counter"] = 48
+    torch.save(payload, path)
+    assert learning.validate_source(path, env.make_env_cfg(stage="bootstrap"), env.BASE_RL_CFG)["clock"] == 48
+    selected = env.selected_training_source(path)
+    assert selected["reward_origin"] == selected["curriculum_clock"] == 24
+    child = env.make_env_cfg(stage="refine", source=path, reward_profile="H1")
+    assert child.rewards["upright"].params["origin_step"] == 24
+    payload.pop("hill_training_contract")
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="contract"):
+        learning.validate_source(path, env.make_env_cfg(stage="bootstrap"), env.BASE_RL_CFG)
+    payload["hill_training_contract"] = learning.training_contract(algorithm)
+    torch.save(payload, path)
+    saved_cfg = yaml.safe_load(cfg_path.read_text())
+    saved_cfg["rewards"]["upright"]["params"]["motion_speed"] = .5
+    cfg_path.write_text(yaml.safe_dump(saved_cfg, sort_keys=False))
+    with pytest.raises(ValueError, match="recipe"):
+        learning.validate_source(path, env.make_env_cfg(stage="bootstrap"), env.BASE_RL_CFG)
+
+
 def test_source_requires_full_model_and_normalizer_state_before_launch(hill_source):
     from microduck_challenges.hill_climb_1m5 import learning
     path, payload = hill_source
@@ -434,7 +681,7 @@ def test_zero_variance_commands_are_valid_normalizer_state(hill_source):
 def test_run_without_execute_only_prints_plan(monkeypatch, capsys):
     import sys
     from microduck_challenges.hill_climb_1m5 import campaign
-    monkeypatch.setattr(sys, "argv", ["campaign", "run"])
+    monkeypatch.setattr(sys, "argv", ["campaign", "run", "--stage", "bootstrap"])
     monkeypatch.setattr(campaign, "run_bounded", lambda *a: pytest.fail("unauthorized launch"))
     campaign.main()
     assert '"launching": false' in capsys.readouterr().out
@@ -493,7 +740,7 @@ def _bind_campaign(path, payload, tmp_path, iterations=1):
     import hashlib
     import json
     from microduck_challenges.hill_climb_1m5 import campaign, evidence
-    plan = campaign.make_plan(iterations=iterations, seed=4)
+    plan = campaign.make_plan(stage="bootstrap", iterations=iterations, seed=4)
     plan["controls"]["save_interval"] = 1
     plan["command"][plan["command"].index("--agent.save-interval") + 1] = "1"
     frozen = tmp_path / "frozen-source.py"
@@ -537,7 +784,7 @@ def test_bounded_launch_binds_child_config_and_checkpoint_to_exact_plan(tmp_path
     def spawn(*a, **kw):
         captured.update(kw["env"])
         return Child()
-    plan = campaign.make_plan(iterations=1, seed=4)
+    plan = campaign.make_plan(stage="bootstrap", iterations=1, seed=4)
     output = tmp_path / "launch"
     with monkeypatch.context() as boundary:
         boundary.setattr(campaign.subprocess, "run", lambda *a, **kw: None)

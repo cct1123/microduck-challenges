@@ -14,7 +14,38 @@ from rsl_rl.algorithms import PPO
 
 TASK = "Mjlab-HillClimb1m5-MicroDuck"
 LOG_ROOT = Path("logs/rsl_rl/hill_climb_1m5").resolve()
-REWARD_PROFILES = {"A0": {}, "A1": {"track_linear_velocity": 0.0}, "B1": {"air_time": 1.5}}
+REWARD_PROFILES = {"A0": {}, "A1": {"track_linear_velocity": 0.0}, "B1": {"air_time": 1.5}, "H1": {}}
+
+# User-authorized exception for ONE genuine artifact, never a relaxed global gate.
+APPROVED_PARTIAL = {
+    "source": "logs/rsl_rl/hill_climb_1m5/2026-10-24_23-10-03_run-1024-2309/model_1000.pt",
+    "sha256": "799ed0b452a1a484b4f700362248779fe127a1ba821a2c545728cdf9c9e814b9",
+    "env_sha256": "9d3c78e38075c64d0e00f48a1c7489e65bbda3b999fb0315e1dd3dcee0453b67",
+    "agent_sha256": "cd9b6ef25b4155d86f1d7c35023bc2aba5164bdd31c12280b537f2a261910155",
+    "provenance_sha256": "8bc46a919424626d502f1f17c9f55ae1a1508d45cbf10ebc1d613f88eee06670",
+    "result_sha256": "bca6ac805265d2a91e13207cf58f6223305eaa5d1ee2f40c83ae7c0727a4ab03",
+    "partial_exception": "model1000-3of5-exploration-only",
+    "base_knobs": {"forward_reward": 3.95619419642857, "upright_reward": 2.,
+                   "step_reward": 6., "max_slope_deg": 10.},
+}
+
+
+def partial_source_pins(config, path, phase):
+    from .evidence import digest
+    if config != APPROVED_PARTIAL:
+        raise ValueError("Missing/tampered exploratory source exception pins")
+    if phase != "explore":
+        raise ValueError("The 3/5 source exception is exploration only; exploitation requires 5/5")
+    path = Path(path)
+    if path.resolve() != Path(APPROVED_PARTIAL["source"]).resolve():
+        raise ValueError("Exploratory exception is only for the pinned model_1000")
+    artifacts = {path: config["sha256"], path.parent / "params/env.yaml": config["env_sha256"],
+                 path.parent / "params/agent.yaml": config["agent_sha256"],
+                 path.parent / "provenance.json": config["provenance_sha256"],
+                 path.parent / "workshop/model_1000.json": config["result_sha256"]}
+    if any(digest(p) != value for p, value in artifacts.items()):
+        raise ValueError("Exploratory source artifact pin changed")
+    return {str(p.resolve()): value for p, value in artifacts.items()}
 
 
 class ConfigLoader(yaml.SafeLoader):
@@ -99,7 +130,7 @@ def phase_settings(training, phase):
     return settings
 
 
-def refinement_recipe(cfg, clock, profile):
+def refinement_recipe(cfg, clock, profile, *, reward_origin=None):
     """Freeze each known bootstrap curriculum at the *source's* age, not its end."""
     overrides = reward_overrides(profile)
     if type(clock) is not int or clock <= 0:
@@ -130,6 +161,9 @@ def refinement_recipe(cfg, clock, profile):
             if term.params.get("reward_name") == name:
                 for stage in term.params.get("weight_stages", []):
                     stage["weight"] = weight
+    if profile == "H1":
+        from .rewards import configure_h1
+        cfg = configure_h1(cfg, clock if reward_origin is None else reward_origin)
     return cfg
 
 
@@ -142,6 +176,48 @@ class HillPpoCfg(PpoWithSymmetryCfg):
     exploration_std_scale: float = 1.0
     campaign_journal: str | None = None
     campaign_plan_digest: str | None = None
+    learning_phase: str = "explore"
+    source_identity: dict | None = None
+    base_knobs: dict | None = None
+    reward_origin: int = 0
+    reward_parameters: dict | None = None
+
+
+CONTRACT_FIELDS = ("learning_phase", "source_identity", "base_knobs", "reward_origin", "reward_parameters")
+
+
+def training_contract(algorithm):
+    if isinstance(algorithm, dict):
+        return {k: algorithm.get(k) for k in CONTRACT_FIELDS}
+    return {k: getattr(algorithm, k, None) for k in CONTRACT_FIELDS}
+
+
+def verify_source_identity(identity):
+    from .evidence import digest, read_report, summarize
+    if (not isinstance(identity, dict) or set(identity) != {"path", "sha256", "artifacts", "partial_exception"}
+            or not identity["artifacts"] or identity["artifacts"].get(identity["path"]) != identity["sha256"]
+            or any(digest(p) != value for p, value in identity["artifacts"].items())):
+        raise ValueError("Missing/tampered Hill source identity pins")
+    if (Path(identity["path"]).resolve() == Path(APPROVED_PARTIAL["source"]).resolve()
+            and identity["partial_exception"] != APPROVED_PARTIAL["partial_exception"]):
+        raise ValueError("Missing approved partial-source exception identity")
+    if identity["partial_exception"] is not None:
+        expected = partial_source_pins(APPROVED_PARTIAL, identity["path"], "explore")
+        if (identity["partial_exception"] != APPROVED_PARTIAL["partial_exception"]
+                or identity["artifacts"] != expected):
+            raise ValueError("Invalid partial-source exception identity")
+    else:
+        path = Path(identity["path"])
+        required = {str(p) for p in (path, path.parent / "params/env.yaml", path.parent / "params/agent.yaml",
+                                    path.parent / "provenance.json", path.parent / "workshop" / f"{path.stem}.json")}
+        if set(identity["artifacts"]) != required:
+            raise ValueError("Incomplete Hill source identity artifacts")
+        result = read_report(path.parent / "workshop" / f"{path.stem}.json")
+        summary = summarize([{**r, "command_vx": result["command_vx"]} for r in result["per_seed"]],
+                            range(1, 6), result["command_vx"])
+        if (result.get("error") or result.get("seeds_total") != 5 or result.get("seeds_finished") != 5
+                or summary["finishes"] != 5 or not math.isclose(summary["mean_s"], result["score"], abs_tol=1e-9)):
+            raise ValueError("Non-exception training source requires consistent 5/5")
 
 
 def mark_actor_only_inference(env, env_ids=None):
@@ -154,7 +230,9 @@ class HillPPO(PPO):
     """Strict full hill warm start; fresh Adam/runner clock, retained env clock."""
 
     def __init__(self, *args, stage="bootstrap", reward_profile="A0", source_clock=0, curriculum_clock=0,
-                 exploration_std_scale=1.0, campaign_journal=None, campaign_plan_digest=None, **kwargs):
+                 exploration_std_scale=1.0, campaign_journal=None, campaign_plan_digest=None,
+                 learning_phase="explore", source_identity=None, base_knobs=None,
+                 reward_origin=0, reward_parameters=None, **kwargs):
         reward_overrides(reward_profile)
         if stage not in ("bootstrap", "refine") or (stage == "bootstrap" and reward_profile != "A0"):
             raise ValueError("Hill bootstrap requires A0; unknown stages are refused")
@@ -163,6 +241,8 @@ class HillPPO(PPO):
         self.exploration_std_scale = self._noise(exploration_std_scale)
         self._restored = False
         self.campaign_journal, self.campaign_plan_digest = campaign_journal, campaign_plan_digest
+        self.learning_phase, self.source_identity, self.base_knobs = learning_phase, source_identity, base_knobs
+        self.reward_origin, self.reward_parameters = reward_origin, reward_parameters
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -175,7 +255,8 @@ class HillPPO(PPO):
         return {**super().save(), "hill_reward_profile": self.reward_profile,
                 "hill_exploration_std_scale": self.exploration_std_scale,
                 "hill_campaign_journal": getattr(self, "campaign_journal", None),
-                "hill_campaign_plan_digest": getattr(self, "campaign_plan_digest", None)}
+                "hill_campaign_plan_digest": getattr(self, "campaign_plan_digest", None),
+                "hill_training_contract": training_contract(self)}
 
     @staticmethod
     def construct_algorithm(obs, env, cfg, device):
@@ -201,6 +282,29 @@ class HillPPO(PPO):
         self._restored = False
         if os.environ.get("MICRODUCK_WARM_START", "") not in ("", "0"):
             raise ValueError("MICRODUCK_WARM_START would restart Hill environment curricula")
+        identity = getattr(self, "source_identity", None)
+        if self.reward_profile == "H1" and identity is None:
+            raise ValueError("H1 training requires its exact source identity pins")
+        if self.reward_profile == "H1":
+            from .rewards import H1
+            assert identity is not None
+            if (self.reward_parameters != H1 or not self.base_knobs
+                    or type(self.reward_origin) is not int or not 0 < self.reward_origin <= self.source_clock
+                    or self.learning_phase not in ("explore", "exploit")):
+                raise ValueError("Invalid H1 target training contract")
+            if identity["partial_exception"] and self.base_knobs != APPROVED_PARTIAL["base_knobs"]:
+                raise ValueError("H1 target differs from the approved source recipe")
+        if identity is not None:
+            verify_source_identity(identity)
+            if identity["partial_exception"] and self.learning_phase != "explore":
+                raise ValueError("The partial-source exception is exploration only")
+            original = torch.load(identity["path"], map_location="cpu", weights_only=False)
+            for name in ("actor_state_dict", "critic_state_dict"):
+                if set(loaded_dict[name]) != set(original[name]) or any(
+                        not torch.equal(loaded_dict[name][k].cpu(), v) for k, v in original[name].items()):
+                    raise ValueError("Restored tensors differ from pinned Hill source")
+            if loaded_dict.get("hill_training_contract") != original.get("hill_training_contract"):
+                raise ValueError("Restored source training contract differs from pinned source")
         clock = (loaded_dict.get("infos") or {}).get("env_state", {}).get("common_step_counter")
         if clock != self.source_clock or type(clock) is not int or clock <= 0:
             raise ValueError("Hill source environment clock changed")
@@ -224,7 +328,7 @@ class HillPPO(PPO):
         super().train_mode()
 
 
-def validate_source(path, baseline, agent, *, require_result=True):
+def validate_source(path, baseline, agent, *, require_result=True, exploratory_exception=None, phase="explore"):
     """Pin an exact Hill source, independently validate its declared recipe first."""
     from .evidence import campaign_evidence, read_report, summarize
 
@@ -235,6 +339,8 @@ def validate_source(path, baseline, agent, *, require_result=True):
     if not re.fullmatch(r"model_(0|[1-9][0-9]*)\.pt", path.name) or path.resolve().parent.parent != LOG_ROOT:
         raise ValueError("Source must be an exact compatible Hill model_N.pt in the Hill experiment")
     path = path.resolve()
+    if exploratory_exception is not None:
+        partial_source_pins(exploratory_exception, path, phase)
     saved_env = read_config(path.parent / "params/env.yaml")
     saved_agent = read_config(path.parent / "params/agent.yaml")
     provenance = read_report(path.parent / "provenance.json")
@@ -250,12 +356,28 @@ def validate_source(path, baseline, agent, *, require_result=True):
         raise ValueError("Unrecognized Hill source algorithm")
     canonical = deepcopy(baseline)
     if source_stage == "refine":
+        if algorithm.get("source_identity") is not None:
+            from .env import make_env_cfg
+            verify_source_identity(algorithm["source_identity"])
+            if not algorithm.get("base_knobs"):
+                raise ValueError("Missing Hill source construction recipe")
+            canonical = make_env_cfg(stage="bootstrap", knobs=algorithm["base_knobs"])
         curriculum_clock = algorithm["curriculum_clock"]
         if type(algorithm["source_clock"]) is not int or algorithm["source_clock"] <= 0:
             raise ValueError("Invalid saved Hill source clock")
         if type(curriculum_clock) is not int or not 0 < curriculum_clock <= algorithm["source_clock"]:
             raise ValueError("Invalid saved Hill curriculum clock")
-        canonical = refinement_recipe(canonical, curriculum_clock, profile)
+        if profile == "H1":
+            from .env import make_env_cfg
+            from .rewards import H1
+            if (algorithm.get("reward_parameters") != H1 or not algorithm.get("base_knobs")
+                    or type(algorithm.get("reward_origin")) is not int
+                    or not 0 < algorithm["reward_origin"] <= algorithm["source_clock"]):
+                raise ValueError("Invalid saved H1 reward parameters/origin/recipe")
+            verify_source_identity(algorithm.get("source_identity"))
+            canonical = make_env_cfg(stage="bootstrap", knobs=algorithm["base_knobs"])
+        canonical = refinement_recipe(canonical, curriculum_clock, profile,
+                                      reward_origin=algorithm.get("reward_origin") if profile == "H1" else None)
     expected = config_data(canonical)
     for group in ("actor", "critic"):
         if list(saved_env["observations"][group]["terms"]) != list(expected["observations"][group]["terms"]):
@@ -285,6 +407,8 @@ def validate_source(path, baseline, agent, *, require_result=True):
         if saved_agent[name] != wanted_agent[name]:
             raise ValueError(f"Incompatible Hill {name}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if (profile == "H1" or algorithm.get("source_identity") is not None) and payload.get("hill_training_contract") != training_contract(algorithm):
+        raise ValueError("Checkpoint and saved H1 training contract disagree")
     campaign_evidence(path, saved_agent, payload)
     if payload.get("hill_reward_profile", "A0") != profile:
         raise ValueError("Checkpoint and saved reward profile disagree")
@@ -309,10 +433,14 @@ def validate_source(path, baseline, agent, *, require_result=True):
         result = read_report(result_path)
         rows = [{**row, "command_vx": result["command_vx"]} for row in result["per_seed"]]
         score = summarize(rows, range(1, 6), result["command_vx"])
+        finishes = 3 if exploratory_exception is not None else 5
         if (result.get("error") or result.get("checkpoint") != payload["iter"]
-                or result.get("seeds_total") != 5 or result.get("seeds_finished") != 5
-                or score["finishes"] != 5 or not math.isclose(score["mean_s"], result["score"], abs_tol=1e-9)):
+                or result.get("seeds_total") != 5 or result.get("seeds_finished") != finishes
+                or score["finishes"] != finishes or not math.isclose(score["mean_s"], result["score"], abs_tol=1e-9)
+                or (exploratory_exception is not None and (result["command_vx"] != .75
+                    or not math.isclose(score["mean_s"], 25.872, abs_tol=1e-9)))):
             raise ValueError("Hill refinement requires a consistent complete 5/5 official result")
     return {"path": path, "clock": clock, "profile": profile, "source_stage": source_stage,
             "curriculum_clock": algorithm["curriculum_clock"] if source_stage == "refine" else clock,
-            "source_env": saved_env, "source_agent": saved_agent, "result_path": result_path}
+            "source_env": saved_env, "source_agent": saved_agent, "result_path": result_path,
+            "partial_exception": exploratory_exception["partial_exception"] if exploratory_exception else None}

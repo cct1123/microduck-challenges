@@ -27,6 +27,7 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
 
 import math
 import os
+import re
 import tomllib
 from copy import deepcopy
 from pathlib import Path
@@ -133,11 +134,53 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
-from .learning import HillPpoCfg, mark_actor_only_inference, phase_settings, refinement_recipe, validate_source
+from .learning import (HillPpoCfg, mark_actor_only_inference, phase_settings, refinement_recipe,
+                       validate_source, APPROVED_PARTIAL, partial_source_pins, read_config)
 
 TRAINING = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
 RECIPE = challenge.load(__file__).recipe
 TRAINING_STAGE = os.environ.get("MICRODUCK_HILL_STAGE", TRAINING["stage"])
+
+
+def selected_training_source(source=None, *, phase=None):
+    """Validate original recipe before applying a target, never use latest globs."""
+    phase = os.environ.get("MICRODUCK_HILL_PHASE", "explore") if phase is None else phase
+    source = source or os.environ.get("MICRODUCK_HILL_SOURCE") or TRAINING.get("refine", {}).get("source")
+    if source is not None and not re.fullmatch(r"model_(0|[1-9][0-9]*)\.pt", Path(source).name):
+        raise ValueError("Source must be an exact compatible Hill model_N.pt")
+    exception, knobs = None, None
+    if source is not None and Path(source).resolve() == Path(APPROVED_PARTIAL["source"]).resolve():
+        exception = TRAINING.get("refine")
+        partial_source_pins(exception, source, phase)
+        knobs = exception["base_knobs"]
+    elif source is not None:
+        # H1 descendants carry the original construction inputs, not today's knobs.
+        saved = read_config(Path(source).parent / "params/agent.yaml") if Path(source).is_file() else {}
+        knobs = saved.get("algorithm", {}).get("base_knobs")
+    selected = validate_source(source, make_env_cfg(stage="bootstrap", knobs=knobs), BASE_RL_CFG,
+                               exploratory_exception=exception, phase=phase)
+    selected["base_knobs"] = deepcopy(knobs or challenge.params(__file__))
+    from .evidence import digest
+    files = (selected["path"], selected["path"].parent / "params/env.yaml",
+             selected["path"].parent / "params/agent.yaml", selected["path"].parent / "provenance.json",
+             selected["result_path"])
+    selected["source_identity"] = {"path": str(selected["path"]), "sha256": digest(selected["path"]),
+        "artifacts": {str(p): digest(p) for p in files}, "partial_exception": selected["partial_exception"]}
+    selected["reward_origin"] = (selected["source_agent"]["algorithm"].get("reward_origin", selected["clock"])
+                                  if selected["profile"] == "H1" else selected["clock"])
+    return selected
+
+
+def refinement_algorithm(selected, phase, profile):
+    from .rewards import H1
+    controls = phase_settings(TRAINING, phase)
+    return HillPpoCfg(**{**asdict(BASE_RL_CFG.algorithm),
+        "stage": "refine", "reward_profile": profile, "source_clock": selected["clock"],
+        "curriculum_clock": selected["curriculum_clock"], "learning_phase": phase,
+        "source_identity": selected["source_identity"], "base_knobs": selected["base_knobs"],
+        "reward_origin": selected["reward_origin"], "reward_parameters": H1 if profile == "H1" else None,
+        "schedule": "fixed", **{k: controls[k] for k in
+            ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale")}})
 
 
 def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -207,25 +250,26 @@ def _soften_terrain_contacts(spec: _mujoco.MjSpec) -> None:
 
 def make_env_cfg(
     play: bool = False,
-    *, stage: str | None = None, reward_profile: str | None = None, source=None,
+    *, stage: str | None = None, reward_profile: str | None = None, source=None, knobs=None,
 ) -> ManagerBasedRlEnvCfg:
     """The hill climb's training environment."""
 
     active_stage = TRAINING_STAGE if stage is None else stage
     profile = reward_profile if reward_profile is not None else (
         os.environ.get("MICRODUCK_HILL_REWARD_PROFILE", TRAINING["reward_profile"])
-        if stage is None else "A0")
+        if active_stage == "refine" and stage is None else "A0")
     if active_stage not in ("bootstrap", "refine"):
         raise ValueError(f"Unknown Hill training stage: {active_stage}")
     if active_stage == "bootstrap" and profile != "A0":
         raise ValueError("Hill bootstrap requires A0; reward experiments need strict refinement")
-    if active_stage == "refine" and source is None:
-        source = os.environ.get("MICRODUCK_HILL_SOURCE")
-        if source is None:
-            raise ValueError("Hill refinement requires an explicit hill source")
+    selected = selected_training_source(source) if active_stage == "refine" else None
 
     # The knobs a novice tunes, from challenge.toml beside this file.
-    knobs = challenge.params(__file__)
+    knobs = selected["base_knobs"] if selected else (challenge.params(__file__) if knobs is None else knobs)
+    schema = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["params"]
+    if set(knobs) != set(schema) or any(type(v) not in (int, float) or not math.isfinite(v)
+            or not schema[k]["min"] <= v <= schema[k]["max"] for k, v in knobs.items()):
+        raise ValueError("Invalid Hill source recipe knobs")
 
     std_standing = {
         # Lower body — tighter to keep the robot in home pose when standing
@@ -930,8 +974,8 @@ def make_env_cfg(
 
     cfg.scene.num_envs = int(RECIPE["num_envs"])
     if active_stage == "refine":
-        selected = validate_source(source, make_env_cfg(stage="bootstrap"), BASE_RL_CFG)
-        cfg = refinement_recipe(cfg, selected["curriculum_clock"], profile)
+        assert selected is not None
+        cfg = refinement_recipe(cfg, selected["curriculum_clock"], profile, reward_origin=selected["reward_origin"])
         phase = os.environ.get("MICRODUCK_HILL_PHASE", "explore")
         cfg.scene.num_envs = phase_settings(TRAINING, phase)["num_envs"]
     return cfg
@@ -984,9 +1028,8 @@ if TRAINING_STAGE == "refine":
     import re
     from .evidence import require_promotion, read_report
 
-    _source = os.environ.get("MICRODUCK_HILL_SOURCE")
-    _selected = validate_source(_source, make_env_cfg(stage="bootstrap"), BASE_RL_CFG)
     _phase = os.environ.get("MICRODUCK_HILL_PHASE", "explore")
+    _selected = selected_training_source(phase=_phase)
     _controls = phase_settings(TRAINING, _phase)
     _profile = os.environ.get("MICRODUCK_HILL_REWARD_PROFILE", TRAINING["reward_profile"])
     if os.environ.get("MICRODUCK_WARM_START", "") not in ("", "0"):
@@ -1004,11 +1047,7 @@ if TRAINING_STAGE == "refine":
     RL_CFG.load_checkpoint = "^" + re.escape(_selected["path"].name) + "$"
     RL_CFG.max_iterations = _controls["max_iterations"]
     RL_CFG.save_interval = _controls["save_interval"]
-    RL_CFG.algorithm = HillPpoCfg(**{**asdict(BASE_RL_CFG.algorithm),
-        "stage": "refine", "reward_profile": _profile, "source_clock": _selected["clock"],
-        "curriculum_clock": _selected["curriculum_clock"],
-        "schedule": "fixed", **{k: _controls[k] for k in
-            ("learning_rate", "entropy_coef", "clip_param", "exploration_std_scale")}})
+    RL_CFG.algorithm = refinement_algorithm(_selected, _phase, _profile)
 
 # Bounded launch injects these before task registration; ordinary Workshop runs
 # explicitly retain None. BASE_RL_CFG stays unbound for source reconstruction.
