@@ -11,9 +11,13 @@ REWARD_PROFILES = {
     "C1": {"track_linear_velocity": 0.0, "air_time": 3.0},
     "C2": {"track_linear_velocity": 0.0, "air_time": 3.0, "speed_forward": 18.0},
     "C3": {"track_linear_velocity": 0.0, "air_time": 3.0, "speed_forward": 18.0},
+    "C4": {"track_linear_velocity": 0.0, "air_time": 3.0, "speed_forward": 18.0},
 }
 
-REWARD_PARAMETER_OVERRIDES = {"C3": {"upright": {"motion_speed": 0.1}}}
+REWARD_PARAMETER_OVERRIDES = {
+    "C3": {"upright": {"motion_speed": 0.1}},
+    "C4": {"upright": {"motion_speed": 0.0}},
+}
 
 
 def reward_overrides(profile):
@@ -58,7 +62,9 @@ def apply_reward_profile(cfg, profile):
         if name not in cfg.rewards:
             raise ValueError(f"Reward profile {profile} requires {name}")
         for key, value in params.items():
-            if key not in cfg.rewards[name].params or not math.isfinite(value) or value <= 0:
+            zero_speed_gate = name == "upright" and key == "motion_speed" and value == 0
+            if (key not in cfg.rewards[name].params or not math.isfinite(value)
+                    or value < 0 or (value == 0 and not zero_speed_gate)):
                 raise ValueError(f"Invalid reward parameter override: {name}.{key}")
         cfg.rewards[name].params.update(params)
     return cfg

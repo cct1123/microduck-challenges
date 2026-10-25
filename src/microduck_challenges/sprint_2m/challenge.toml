@@ -33,7 +33,7 @@ max   = 6.0
 [training]
 stage = "refine"
 phase = "explore"
-reward_profile = "C3"      # C2 plus full forward-lean tolerance by 0.1 m/s
+reward_profile = "C4"      # C3 weights; full forward-lean tolerance at every speed
 
 [training.phases.explore]
 max_iterations = 500

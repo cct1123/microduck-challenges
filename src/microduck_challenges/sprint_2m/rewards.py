@@ -239,22 +239,27 @@ def course_forward_speed(env, vel_ref=1.5, asset_cfg: SceneEntityCfg = _DEFAULT_
 
 def drive_upright(env, std, forward_variance, hold_steps, ramp_steps, motion_speed,
                   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, max_tilt_deg=60.0):
-    """Permit nose-down pitch during forward travel, not roll/backward lean or camping.
+    """Widen nose-down tolerance without relaxing roll/backward pitch or fall guards.
 
     On the flat Sprint course projected gravity x is positive for nose-down
     pitch. Keep the original upright optimum; only widen its forward tolerance
     as the stage advances AND course speed rises from zero to motion_speed.
+    Explicit motion_speed=0 removes velocity gating, including at rest/reverse.
     """
     for name, value in (("std", std), ("forward_variance", forward_variance),
-                        ("ramp_steps", ramp_steps), ("motion_speed", motion_speed)):
+                        ("ramp_steps", ramp_steps)):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")
+    if not math.isfinite(motion_speed) or motion_speed < 0:
+        raise ValueError("motion_speed must be finite and nonnegative")
     if not math.isfinite(hold_steps) or hold_steps < 0 or forward_variance < std**2:
         raise ValueError("hold_steps must be nonnegative and forward variance cannot tighten upright")
     speed, valid = _course_velocity(env, asset_cfg, max_tilt_deg)
     gravity = env.scene[asset_cfg.name].data.projected_gravity_b
     fraction = min(1.0, max(0.0, (env.common_step_counter - hold_steps) / ramp_steps))
-    blend = fraction * (speed / motion_speed).clamp(0.0, 1.0)
+    speed_fraction = (torch.ones_like(speed) if motion_speed == 0
+                      else (speed / motion_speed).clamp(0.0, 1.0))
+    blend = fraction * speed_fraction
     variance = std**2 + blend * (forward_variance - std**2)
     pitch_variance = torch.where(gravity[:, 0] > 0, variance, std**2)
     value = torch.exp(-gravity[:, 0].square() / pitch_variance

@@ -493,7 +493,8 @@ def main():
     parser.add_argument("--phase", choices=("explore", "exploit"), default="explore")
     parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default=None,
                         help="A0 control; A1 tracking off; B1 air time 3; B2 speed 18; "
-                             "C1 tracking off + air time 3; C2 C1 + speed 18; C3 C2 + full lean at 0.1 m/s")
+                             "C1 tracking off + air time 3; C2 C1 + speed 18; "
+                             "C3 C2 + full lean at 0.1 m/s; C4 full lean without velocity gating")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--promotion", type=Path)
     parser.add_argument("--iterations", type=int)

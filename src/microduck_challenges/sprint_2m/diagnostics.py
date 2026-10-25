@@ -144,7 +144,8 @@ def markdown_report(report):
                   "B1: air time -> 3. B2: course speed -> 18. "
                   "C1: linear tracking -> 0 AND air time -> 3; compared with A1 only air time changes. "
                   "C2: C1 plus course speed -> 18; compared with C1 only speed weight changes. "
-                  "C3: C2 plus upright.motion_speed -> 0.1; full forward-lean tolerance by 0.1 m/s.",
+                  "C3: C2 plus upright.motion_speed -> 0.1; full forward-lean tolerance by 0.1 m/s. "
+                  "C4: C3 weights plus upright.motion_speed -> 0; no velocity gate on forward-lean tolerance.",
                   "Reward-parameter changes cannot be rescored from logged reward sums.",
                   "These are unvalidated experiments; select by legal finish time and completion, not larger reward."])
     return "\n".join(lines) + "\n"

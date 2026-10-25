@@ -57,7 +57,7 @@ def test_profile_changes_only_named_settings_and_cannot_reramp(source, profile):
     assert control.rewards["pose"].weight == 0
 
 
-@pytest.mark.parametrize("profile", ("A1", "C2", "C3"))
+@pytest.mark.parametrize("profile", ("A1", "C2", "C3", "C4"))
 def test_profile_source_is_independently_validated_and_marker_bound(source, profile):
     baseline, selected = source
     candidate = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
@@ -198,9 +198,9 @@ def test_scoring_and_launch_defaults_fail_closed(tmp_path, monkeypatch):
 
 def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypatch):
     _, selected = source
-    assert env.STAGE_SETTINGS["reward_profile"] == "C3"
+    assert env.STAGE_SETTINGS["reward_profile"] == "C4"
     default = experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine")
-    assert default == "C3"
+    assert default == "C4"
     assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine", "A0") == "A0"
     assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "baseline") == "A0"
     with pytest.raises(ValueError, match="strict refinement"):
@@ -213,7 +213,7 @@ def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypat
     assert control.rewards["track_linear_velocity"].weight > 0
     assert cfg.rewards["speed_forward"].weight == 18 and control.rewards["speed_forward"].weight == 12
     assert cfg.rewards["air_time"].weight == 3 and control.rewards["air_time"].weight == 6
-    assert cfg.rewards["upright"].params["motion_speed"] == .1
+    assert cfg.rewards["upright"].params["motion_speed"] == 0
     assert control.rewards["upright"].params["motion_speed"] == .5
 
 
@@ -283,3 +283,39 @@ def test_c3_changes_only_lean_speed_and_preserves_direction_and_fall_guards(sour
     probe._sprint_tilt_guard = SimpleNamespace(failed=torch.zeros(len(speed), dtype=torch.bool))
     probe._sprint_tilt_guard.failed[3] = True
     assert rewards.drive_upright(probe, **candidate.rewards["upright"].params)[3] == 0
+
+
+def test_c4_removes_all_velocity_gating_without_relaxing_other_axes_or_fall_rules(source):
+    baseline, selected = source
+    control = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
+                                                 reward_profile="C3")
+    candidate = rewards.configure_refine_locomotion(deepcopy(baseline), env.REFINE_SETTINGS, selected,
+                                                   reward_profile="C4")
+    before, after = rewards._config_data(control), rewards._config_data(candidate)
+    assert before["rewards"]["upright"]["params"]["motion_speed"] == .1
+    assert after["rewards"]["upright"]["params"]["motion_speed"] == 0
+    after["rewards"]["upright"]["params"]["motion_speed"] = .1
+    assert before == after
+    speed = torch.tensor([-.2, 0., 1e-6, .05, .1, .5, .1, .1, float("nan")])
+    gravity = torch.zeros(len(speed), 3)
+    gravity[:, 0] = .5
+    gravity[6, :2] = torch.tensor([0., .5])
+    gravity[7, 0] = -.5
+    gravity[:, 2] = -torch.sqrt(1 - gravity[:, :2].square().sum(-1))
+    data = SimpleNamespace(root_link_quat_w=torch.tensor([[1., 0, 0, 0]]).repeat(len(speed), 1),
+                           projected_gravity_b=gravity,
+                           root_link_lin_vel_w=torch.stack((speed, torch.zeros_like(speed), torch.zeros_like(speed)), -1))
+    probe = SimpleNamespace(scene={"robot": SimpleNamespace(data=data)}, num_envs=len(speed),
+                            device="cpu", common_step_counter=10**9, episode_length_buf=torch.ones(len(speed)))
+    old = rewards.drive_upright(probe, **control.rewards["upright"].params)
+    new = rewards.drive_upright(probe, **candidate.rewards["upright"].params)
+    assert torch.isfinite(new).all() and new[-1] == 0
+    torch.testing.assert_close(new[:6], new[0].expand(6), rtol=0, atol=0)
+    assert torch.all(new[:4] > old[:4])
+    torch.testing.assert_close(new[[6, 7]], old[[6, 7]], rtol=0, atol=0)
+    for invalid in (-.1, float("nan")):
+        with pytest.raises(ValueError, match="motion_speed"):
+            rewards.drive_upright(probe, **{**candidate.rewards["upright"].params, "motion_speed": invalid})
+    probe._sprint_tilt_guard = SimpleNamespace(failed=torch.zeros(len(speed), dtype=torch.bool))
+    probe._sprint_tilt_guard.failed[0] = True
+    assert rewards.drive_upright(probe, **candidate.rewards["upright"].params)[0] == 0
