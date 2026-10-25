@@ -62,9 +62,9 @@ max_wall_minutes = 40     # cap each explicitly requested local run
 [training.refine]
 # Preserve the source policy and environment age; free the legs for the next run.
 free_legs = true           # no leg pose reward or leg action-rate cost; head smoothing stays
-source_run = "2026-10-24_01-21-50_run-1024-0121"
-# Explicit winner; never silently substitute the final model_9999.
-source_checkpoint = 8250
+source_run = "2026-10-24_22-11-29_run-1024-2211"
+# Best known compatible 5/5 winner; keep model_8250 as an archived fallback.
+source_checkpoint = 350
 # Budgets and PPO controls come only from training.phases.<phase> above.
 # Source drive construction scalars for strict semantic validation, not a new ramp.
 source_baseline_checkpoint = 2250
