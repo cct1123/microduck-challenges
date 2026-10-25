@@ -2,7 +2,7 @@
 
 ## Opt-in reward experiments and plateau audit
 
-The next Workshop/train run defaults to **C3**, selected explicitly by
+The next Workshop/train run defaults to **C4**, selected explicitly by
 `training.reward_profile` in `challenge.toml`. Campaign plan/run/smoke use the
 same default. The `--reward-profile` option selects one explicitly named recipe:
 
@@ -15,6 +15,7 @@ same default. The `--reward-profile` option selects one explicitly named recipe:
 | `C1` | Explicit combination: tracking -> 0 AND air time -> 3; only air time differs from A1 |
 | `C2` | C1 plus course-speed weight -> 18; only speed weight differs from C1 |
 | `C3` | C2 plus `upright.motion_speed` -> 0.1 m/s; only the lean-speed parameter differs from C2 |
+| `C4` | Same weights as C3; `upright.motion_speed` -> 0 explicitly disables all velocity gating |
 
 These are hypotheses, not demonstrated speed gains. The C2 comparison starts
 from the same retained model_8250 and keeps
@@ -54,10 +55,32 @@ Apply the prepared patch only after that run exits and the protected source
 hashes still match. Do not stop/restart the active run, change PPO or budgets,
 promote a checkpoint, or launch another run as part of preparing C3.
 
+### No velocity requirement for forward lean (C4)
+
+C4 makes the full existing forward-pitch variance 0.80 available at every valid
+velocity, including standing and reverse motion, at the mature refinement
+clock. `motion_speed = 0` is an explicit no-gating mode, not a tiny threshold
+or division by zero. Positive thresholds retain their original formulas and
+all A0–C3 meanings. Upright still scores highest; leaning is tolerated, not
+given a separate bonus. Roll/backward-pitch penalties remain unchanged.
+
+The user explicitly retained the official fall limits: the 75-degree/0.5-second
+proposal is NOT applied. The held-fall guard remains >60 degrees for 0.3 s;
+the existing immediate 70-degree cutoff, finite-state checks, mechanical
+limits, event/evaluator, observations and PPO controls remain unchanged.
+Air time is unchanged: weight 3, current airborne time strictly between
+0.125 and 0.300 s, commanded-motion norm >0.01, no actual-progress or landing
+requirement. Looser lean may make idle leaning more attractive; this is an
+unvalidated reward preference, not proof of faster or always-legal finishes.
+
+Prepare and test C4 outside the live source while a trainer is running. Apply
+only after it exits, protected source hashes still match and no replacement
+trainer has started. Do not restart training or publish automatically.
+
 The CLI is non-launching without the existing explicit `run --execute` switch:
 
 ```bash
-uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C3
+uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile C4
 ```
 
 `--reward-profile A0` selects the unchanged control. An explicit
@@ -135,7 +158,7 @@ smoke/export check in a fresh directory:
 
 ```bash
 uv run --group workshop python -m microduck_challenges.sprint_2m.campaign smoke \
-  --phase explore --reward-profile C3 --output logs/verification/my-c3-smoke
+  --phase explore --reward-profile C4 --output logs/verification/my-c4-smoke
 ```
 
 This verifies software/restore/export only, not improved racing performance.
@@ -145,7 +168,7 @@ later separately authorized stages, not automatically started by this feature.
 ## Goal and invariant
 
 Target: a legal **2 m finish averaging 0.8 s**, without sacrificing reliable completion.
-The retained starting checkpoint is `2026-10-24_01-21-50_run-1024-0121/model_8250.pt` (saved official score 1.224 s, 5/5, command 0.30 m/s). It is not overwritten, automatically replaced by the latest checkpoint, or certified by a training-reward curve.
+The current best-known exploration source is `2026-10-24_22-11-29_run-1024-2211/model_350.pt` (Workshop 1.180 s, 5/5, command 0.35 m/s). Keep model_8250 archived as a fallback. Before each improvement run, recheck completed compatible 5/5 candidates and explicitly pin the best known source; do not reset to the original source or replace it with a worse final checkpoint. These are development sweep results, not held-out certification or exploitation approval.
 
 All stages retain the real robot, actuator limits, scale 1.0/no action clipping, ordered 61D actor and 14D actions, the source's 81D critic, heading guidance, head smoothing, and independent fall guards. Leg pose preference and leg action-rate costs remain off in **both** phases; conservatism comes from learning controls and selection, not locking the legs. The existing 20-second dense locomotion objective is unchanged. This is not yet an exact finite race-time objective.
 
