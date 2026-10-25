@@ -6,7 +6,7 @@ kind  = "perpetual"
 
 [recipe]                  # the first training, as is
 num_envs       = 2048
-max_iterations = 3000
+max_iterations = 500
 seed           = 1
 
 # Bootstrap keeps the original beginner curriculum and optimization recipe.
@@ -43,13 +43,13 @@ heldout_seed_count = 20
 
 [params.forward_reward]
 label = "Follow the speed order"
-value = 3.95619419642857
+value = 5.0
 min   = 0.5
 max   = 5.0
 
 [params.upright_reward]
 label = "Stay upright"
-value = 2.0
+value = 1.00167410714286
 min   = 0.5
 max   = 5.0
 
