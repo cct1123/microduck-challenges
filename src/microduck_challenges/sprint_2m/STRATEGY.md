@@ -2,8 +2,9 @@
 
 ## Opt-in reward experiments and plateau audit
 
-Default Workshop training remains **A0**, unchanged. The new campaign option
-`--reward-profile` selects exactly one independently defined experiment:
+The next Workshop/train run defaults to **A1**, selected explicitly by
+`training.reward_profile` in `challenge.toml`. Campaign plan/run/smoke use the
+same default. The `--reward-profile` option selects one explicitly named recipe:
 
 | Profile | Difference from the mature A0 recipe |
 |---|---|
@@ -28,10 +29,19 @@ The CLI is non-launching without the existing explicit `run --execute` switch:
 uv run --group workshop python -m microduck_challenges.sprint_2m.campaign plan --phase explore --reward-profile A1
 ```
 
-Raw training can opt in using `MICRODUCK_SPRINT_REWARD_PROFILE=A1` (refine stage
-only), but the campaign remains the bounded, locked, provenance-recorded path.
-No TOML/Workshop defaults need changing. A running trainer retains its already
-loaded recipe and is never restarted by inspecting/planning an experiment.
+`--reward-profile A0` selects the unchanged control. An explicit
+`MICRODUCK_SPRINT_REWARD_PROFILE` overrides the TOML default for raw training
+(refine stage only). Baseline/speed/drive diagnostic stages retain A0 unless an
+invalid non-A0 override is supplied, which is refused. The campaign remains the
+bounded, locked, provenance-recorded path. A running trainer retains its loaded
+recipe; changing the file does not alter it. Startup prints the actual selected
+profile and overrides. Commit the implementation before pressing Train (Workshop
+refuses a dirty checkout), then refresh the page before starting the next run.
+
+The completed `2026-10-24_17-22-58_run-1024-1722` was A0, not A1: its saved
+tracking weight stayed 0.4927176. Its best Workshop result was 1.208 s at
+checkpoint 0; the final checkpoint scored 1.272 s, with reliability regressions
+at intermediate checkpoints. That run did not test A1.
 
 Read existing logs without inference, rollout or training:
 

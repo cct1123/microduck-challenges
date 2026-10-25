@@ -33,6 +33,7 @@ max   = 6.0
 [training]
 stage = "refine"
 phase = "explore"
+reward_profile = "A1"      # no exact commanded-linear-speed tracking
 
 [training.phases.explore]
 max_iterations = 500

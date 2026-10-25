@@ -18,6 +18,17 @@ def reward_overrides(profile):
     return dict(REWARD_PROFILES[profile])
 
 
+def resolve_reward_profile(training, stage, override=None):
+    """Use the shared recipe for refinement; archived stages stay unmodified."""
+    profile = override if override is not None else (
+        training.get("reward_profile", "A0") if stage == "refine" else "A0"
+    )
+    reward_overrides(profile)
+    if stage != "refine" and profile != "A0":
+        raise ValueError("Reward experiments require the strict refinement warm-start path")
+    return profile
+
+
 def apply_reward_profile(cfg, profile):
     """Apply ONLY after source validation; freeze matching curriculum endpoints."""
     overrides = reward_overrides(profile)

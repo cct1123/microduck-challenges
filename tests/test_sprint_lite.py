@@ -191,3 +191,22 @@ def test_scoring_and_launch_defaults_fail_closed(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="trainer"):
         campaign.run_bounded({}, tmp_path / "must-not-exist")
     assert not (tmp_path / "must-not-exist").exists()
+
+
+def test_recipe_default_and_explicit_control_reach_the_factory(source, monkeypatch):
+    _, selected = source
+    assert env.STAGE_SETTINGS["reward_profile"] == "A1"
+    default = experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine")
+    assert default == "A1"
+    assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "refine", "A0") == "A0"
+    assert experiments.resolve_reward_profile(env.STAGE_SETTINGS, "baseline") == "A0"
+    with pytest.raises(ValueError, match="strict refinement"):
+        experiments.resolve_reward_profile(env.STAGE_SETTINGS, "baseline", "A1")
+    monkeypatch.setattr(env, "REFINE_CHECKPOINT", selected)
+    monkeypatch.setattr(env, "TRAINING_REWARD_PROFILE", default)
+    cfg = env.make_env_cfg(stage="refine")
+    control = env.make_env_cfg(stage="refine", reward_profile="A0")
+    assert cfg.rewards["track_linear_velocity"].weight == 0
+    assert control.rewards["track_linear_velocity"].weight > 0
+    assert cfg.rewards["speed_forward"].weight == control.rewards["speed_forward"].weight == 12
+    assert cfg.rewards["air_time"].weight == control.rewards["air_time"].weight == 6

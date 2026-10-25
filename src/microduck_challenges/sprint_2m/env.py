@@ -121,7 +121,7 @@ from .rewards import (
 )
 from .learning import SprintRefinePpoCfg, phase_settings
 from .promotion import require_promotion
-from .experiments import reward_overrides
+from .experiments import resolve_reward_profile, reward_overrides
 
 TRAINING_RECIPE = challenge.load(__file__).recipe
 STAGE_SETTINGS = tomllib.loads(Path(__file__).with_name("challenge.toml").read_text())["training"]
@@ -131,10 +131,9 @@ if TRAINING_STAGE not in ("baseline", "speed", "drive", "refine"):
 SPEED_SETTINGS = STAGE_SETTINGS["speed"]
 DRIVE_SETTINGS = STAGE_SETTINGS["drive"]
 TRAINING_PHASE = os.environ.get("MICRODUCK_SPRINT_PHASE", STAGE_SETTINGS["phase"])
-TRAINING_REWARD_PROFILE = os.environ.get("MICRODUCK_SPRINT_REWARD_PROFILE", "A0")
-reward_overrides(TRAINING_REWARD_PROFILE)
-if TRAINING_STAGE != "refine" and TRAINING_REWARD_PROFILE != "A0":
-    raise ValueError("Reward experiments require the strict refinement warm-start path")
+TRAINING_REWARD_PROFILE = resolve_reward_profile(
+    STAGE_SETTINGS, TRAINING_STAGE, os.environ.get("MICRODUCK_SPRINT_REWARD_PROFILE"),
+)
 REFINE_SETTINGS = {**STAGE_SETTINGS["refine"], **phase_settings(STAGE_SETTINGS, TRAINING_PHASE)}
 if _source_override := os.environ.get("MICRODUCK_SPRINT_SOURCE"):
     _source_path = Path(_source_override)
@@ -745,3 +744,6 @@ if TRAINING_STAGE in ("speed", "drive", "refine"):
           f"5/5 in {_selected['score']:.3f}s at "
           f"{_selected['command_vx']:.2f}m/s; "
           "the runner logs the checkpoint actually loaded")
+    if TRAINING_STAGE == "refine":
+        print(f"[sprint rewards] target profile={TRAINING_REWARD_PROFILE}; "
+              f"overrides={reward_overrides(TRAINING_REWARD_PROFILE)}")

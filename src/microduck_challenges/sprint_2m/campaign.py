@@ -50,7 +50,8 @@ def selected_source(source=None):
     return selected
 
 
-def make_plan(phase, source=None, promotion_path=None, iterations=None, seed=None, reward_profile="A0"):
+def make_plan(phase, source=None, promotion_path=None, iterations=None, seed=None, reward_profile=None):
+    reward_profile = sprint_env.TRAINING_REWARD_PROFILE if reward_profile is None else reward_profile
     overrides = reward_overrides(reward_profile)
     controls = phase_settings(sprint_env.STAGE_SETTINGS, phase)
     if promotion_path and source is None:
@@ -256,13 +257,14 @@ def assess(run, incumbent, output):
     return report
 
 
-def smoke(phase, source, output, reward_profile="A0"):
+def smoke(phase, source, output, reward_profile=None):
     """Two real CPU updates of phase controls; this does not approve racing fitness."""
     import torch
     from mjlab.scripts.train import TrainConfig, run_train
     from mjlab_microduck.tasks import MicroduckOnPolicyRunner
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+    reward_profile = sprint_env.TRAINING_REWARD_PROFILE if reward_profile is None else reward_profile
     selected = selected_source(source)
     source = selected["path"]
     output = Path(output).resolve()
@@ -482,7 +484,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "run", "smoke", "assess"))
     parser.add_argument("--phase", choices=("explore", "exploit"), default="explore")
-    parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default="A0",
+    parser.add_argument("--reward-profile", choices=tuple(REWARD_PROFILES), default=None,
                         help="A0 control, A1 no linear tracking, B1 less air time, B2 stronger speed (not combined)")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--promotion", type=Path)
