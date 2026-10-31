@@ -88,7 +88,7 @@ uv run hf download pollen-robotics/microduck-sprint-2m-reference policy.onnx --l
 uv run --group workshop arena score logs/reference/sprint-2m/policy.onnx --event sprint-2m
 ```
 
-It scores 4.892 s, 5/5, at 0.55 m/s (checkpoint 1000 of the recipe as it stands in this folder).
+It scores 4.883 s, 5/5, at 0.55 m/s (checkpoint 1000 of the recipe as it stands in this folder).
 
 Agree with the user before the first run:
 

@@ -845,8 +845,8 @@ wheels = [
 
 [[package]]
 name = "microduck-arena"
-version = "0.5.0"
-source = { url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.5.0/microduck_arena-0.5.0-py3-none-any.whl" }
+version = "0.7.0"
+source = { url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.7.0/microduck_arena-0.7.0-py3-none-any.whl" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
@@ -859,7 +859,7 @@ dependencies = [
     { name = "websockets" },
 ]
 wheels = [
-    { url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.5.0/microduck_arena-0.5.0-py3-none-any.whl", hash = "sha256:30953c6886ac00a48f37bc18dd21b666197d47ac30f149033842800343343889" },
+    { url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.7.0/microduck_arena-0.7.0-py3-none-any.whl", hash = "sha256:6404e09e55b77ac0a3289a25110d7d901bc12ed493778394ec003ab264f3b1f5" },
 ]
 
 [package.metadata]
@@ -907,7 +907,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]
-workshop = [{ name = "microduck-arena", url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.5.0/microduck_arena-0.5.0-py3-none-any.whl" }]
+workshop = [{ name = "microduck-arena", url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.7.0/microduck_arena-0.7.0-py3-none-any.whl" }]
 
 [[package]]
 name = "mjlab"
@@ -942,7 +942,7 @@ wheels = [
 [[package]]
 name = "mjlab-microduck"
 version = "0.1.0"
-source = { git = "https://github.com/pollen-robotics/microduck_rl?branch=challenge-recipe-publishing#8d0dbc94cbbef3f1dcae461a4dbc1a43bb9886a0" }
+source = { git = "https://github.com/pollen-robotics/microduck_rl?branch=challenge-recipe-publishing#1efd853be9fcdf050da24b5723cb74ada9a731d7" }
 dependencies = [
     { name = "better-actuator-models" },
     { name = "huggingface-hub" },

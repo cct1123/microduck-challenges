@@ -1,0 +1,44 @@
+# The 6 m Sock Heist: walk 6 m to steal a giant microduck's socks, and freeze whenever it turns its head.
+# Moving more than 3 cm while it looks is caught; the learner starts as the reference walker.
+event = "sock-heist-6m"
+task  = "Mjlab-SockHeist6m-MicroDuck"
+kind  = "perpetual"
+
+# What the policy reads in each command group: publish writes it in the manifest.
+[command]
+twist = "[vx: the speed the Arena times you at, 0 from the moment the giant starts turning its head until it looks away; unused; yaw rate: the lane's heading hold, 0 while the giant turns or looks]"
+
+[recipe]                  # the first training, as is
+num_envs       = 4096
+max_iterations = 1000
+seed           = 1
+
+[params.forward_reward]
+label = "Walk on green"
+value = 2.0
+min   = 0.5
+max   = 5.0
+
+[params.progress_reward]
+label = "Walk forward"
+value = 8.0
+min   = 0.0
+max   = 16.0
+
+[params.freeze_reward]
+label = "Freeze while watched"
+value = 2.0
+min   = 0.0
+max   = 6.0
+
+[params.upright_reward]
+label = "Stay upright"
+value = 2.0
+min   = 0.5
+max   = 5.0
+
+[params.step_reward]
+label = "Lift your feet"
+value = 3.0
+min   = 0.0
+max   = 6.0

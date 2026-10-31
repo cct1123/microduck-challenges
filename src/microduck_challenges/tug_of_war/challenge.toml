@@ -1,0 +1,42 @@
+# The Tug of War: two ducks tied neck to neck in a 3 m ring, over a pit; only the pit decides.
+# The learner starts as the reference duck and trains against it; keep its best checkpoint, not the last.
+event = "tug-of-war"
+task  = "Mjlab-TugOfWar-MicroDuck"
+kind  = "perpetual"
+
+# What the policy reads in each command group: publish writes it in the manifest.
+[command]
+twist = "[vx: the Arena sends -0.30 m/s, walk backwards; unused; unused]"
+
+[recipe]                  # the first training, as is
+num_envs       = 4096
+max_iterations = 1000
+seed           = 1
+
+[params.pull_reward]
+label = "Win ground"
+value = 2.0
+min   = 0.5
+max   = 5.0
+
+[params.back_reward]
+label = "Walk backwards"
+value = 3.0
+min   = 0.0
+max   = 4.0
+
+[params.upright_reward]
+label = "Keep the trunk level"
+value = 1.0
+min   = 0.0
+max   = 4.0
+
+# 0 lets the duck crouch, sit, lie or plant its head as the Arena allows; above 0 it must
+# walk upright: trunk 10 cm up or more, pitched 10° forward to 20° back, rolled 10° at most,
+# its head 18 cm up or more, neck and head within 30° of standing, only its feet on the
+# course. Out of that for 0.3 s ends the training episode and costs that many pits.
+[params.stay_upright]
+label = "Stay upright"
+value = 0.0
+min   = 0.0
+max   = 2.0

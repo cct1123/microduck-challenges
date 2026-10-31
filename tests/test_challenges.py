@@ -42,6 +42,19 @@ CHALLENGES = {
         "speed_reward": ("wheel_speed", 13.5),
         "upright_reward": ("upright", 1.3),
     },
+    "tug_of_war": {
+        "pull_reward": ("marker_ground", 3.1),
+        "back_reward": ("track_linear_velocity", 2.3),
+        "upright_reward": ("upright", 1.7),
+        "stay_upright": (None, 1.0),
+    },
+    "sock_heist_6m": {
+        "forward_reward": ("track_linear_velocity", 3.7),
+        "progress_reward": ("progress", 5.3),
+        "freeze_reward": ("freeze", 1.3),
+        "upright_reward": ("upright", 1.3),
+        "step_reward": ("air_time", 4.1),
+    },
 }
 
 ROOT = Path(microduck_challenges.__file__).parent
@@ -52,7 +65,7 @@ def _contract(folder):
 
 
 # The challenges whose Arena event races a commanded speed; MicroDuck Got a Talent is judged on style.
-RACES = ["sprint_2m", "hill_climb_1m5", "roller_sprint_2m"]
+RACES = ["sprint_2m", "hill_climb_1m5", "roller_sprint_2m", "sock_heist_6m"]
 
 
 @pytest.mark.parametrize("folder", RACES)
@@ -66,7 +79,7 @@ def test_training_covers_the_speeds_the_arena_commands(folder):
     assert ranges.lin_vel_y == (0.0, 0.0) and ranges.ang_vel_z == (0.0, 0.0)
 
 
-@pytest.mark.parametrize("folder", ["sprint_2m", "hill_climb_1m5"])
+@pytest.mark.parametrize("folder", ["sprint_2m", "hill_climb_1m5", "sock_heist_6m"])
 def test_walking_training_reaches_the_top_of_the_sweep(folder):
     # roller_sprint_2m is excluded: its top command is the robot's measured push
     # limit, not the Arena's sweep top (see roller_sprint_2m/env.py).

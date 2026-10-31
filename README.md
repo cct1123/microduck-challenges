@@ -9,6 +9,8 @@ working training environment: train it unchanged and the robot competes.
 | got_a_talent | got-a-talent | Mjlab-GotATalent-MicroDuck |
 | hill_climb_1m5 | hill-climb-1m5 | Mjlab-HillClimb1m5-MicroDuck |
 | roller_sprint_2m | roller-sprint-2m | Mjlab-RollerSprint2m-MicroDuck |
+| tug_of_war | tug-of-war | Mjlab-TugOfWar-MicroDuck |
+| sock_heist_6m | sock-heist-6m | Mjlab-SockHeist6m-MicroDuck |
 
 Training with a coding agent (Claude Code, Codex, Cursor…)? Each challenge folder has an
 `AGENTS.md` that tells it which files to change, how to run and judge a training, and the
@@ -27,6 +29,21 @@ wheees), a `song` of notes beside the keyframes, and a `voice` that tunes it (th
 A performance can also be a troupe of up to 8 ducks in one physics. Each duck has its own policy
 (yours, or any public one on the Hub pinned to a commit, on legs or rollers), place, keyframes,
 voice and song: see the guide's Troupe and Placement sections.
+
+The Tug of War is a duel: two ducks neck to neck in a 3 m ring, over a pit, each pulling a 1 m string by walking
+backwards at `-0.30 m/s`; only the pit decides, and the marker if nobody falls in. The Arena rates a
+policy by five 45 s bouts against its reference duck, in centimetres of ground won plus a pit bonus
+(higher wins), and each player's latest entry plays the weekly cup. The recipe starts the learner as that reference
+duck and trains it against it for 1000 iterations; it peaks early (250 to 500), so rate every
+checkpoint and keep the best, not the last. Its `stay_upright` knob, off by default, makes a duck walk upright, as the robot walks.
+Play two policies against each other (B defaults to the reference) with
+`uv run --frozen --group workshop python -m microduck_challenges.tug_of_war.check A.onnx [B.onnx] [--bouts 10]`.
+
+The Sock Heist is a race with a rule: 6 m to the socks of a giant microduck's nest, and freeze whenever the giant
+turns its head to the lanes, or be caught. The policy sees only its command, zero on red, and each seed's timetable is
+the same for every entrant. Say why each seed of a policy ended with
+`uv run --frozen --group workshop python -m microduck_challenges.sock_heist_6m.check policy.onnx [--speed V] [--seeds N]`.
+The recipe starts the learner as the reference walker.
 
 ## The workshop
 

@@ -12,6 +12,8 @@ files to change, how to run and judge a training, the challenge's rules and what
 | 2 m Sprint | `sprint-2m` | [src/microduck_challenges/sprint_2m/AGENTS.md](src/microduck_challenges/sprint_2m/AGENTS.md) |
 | 1.5 m Hill Climb | `hill-climb-1m5` | [src/microduck_challenges/hill_climb_1m5/AGENTS.md](src/microduck_challenges/hill_climb_1m5/AGENTS.md) |
 | 2 m Roller Sprint | `roller-sprint-2m` | [src/microduck_challenges/roller_sprint_2m/AGENTS.md](src/microduck_challenges/roller_sprint_2m/AGENTS.md) |
+| Tug of War | `tug-of-war` | [src/microduck_challenges/tug_of_war/AGENTS.md](src/microduck_challenges/tug_of_war/AGENTS.md) |
+| 6 m Sock Heist | `sock-heist-6m` | [src/microduck_challenges/sock_heist_6m/AGENTS.md](src/microduck_challenges/sock_heist_6m/AGENTS.md) |
 | MicroDuck Got a Talent | `got-a-talent` | [src/microduck_challenges/got_a_talent/AGENTS.md](src/microduck_challenges/got_a_talent/AGENTS.md) |
 
 If the user has not said which challenge, ask.

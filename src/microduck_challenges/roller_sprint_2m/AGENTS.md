@@ -97,7 +97,7 @@ uv run hf download pollen-robotics/microduck-roller-sprint-2m-reference policy.o
 uv run --group workshop arena score logs/reference/roller-sprint-2m/policy.onnx --event roller-sprint-2m
 ```
 
-It scores 3.128 s, 5/5, at 1.00 m/s (checkpoint 2999 of the recipe as it stands in this folder).
+It scores 3.121 s, 5/5, at 1.00 m/s (checkpoint 2999 of the recipe as it stands in this folder).
 
 Agree with the user before the first run:
 

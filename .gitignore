@@ -6,3 +6,5 @@ __pycache__/
 publish-*/
 wandb/
 *.onnx
+!src/microduck_challenges/tug_of_war/reference.onnx
+!src/microduck_challenges/sock_heist_6m/walker.onnx

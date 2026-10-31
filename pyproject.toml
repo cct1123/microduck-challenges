@@ -58,7 +58,7 @@ override-dependencies = [
 # is re-made: an un-frozen `uv sync` (as in an HF job) fetches it directly.
 mjlab-microduck = { git = "https://github.com/pollen-robotics/microduck_rl", branch = "challenge-recipe-publishing" }
 # The Arena's wheel, as its release workflow attaches it to the tag.
-microduck-arena = { url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.5.0/microduck_arena-0.5.0-py3-none-any.whl" }
+microduck-arena = { url = "https://github.com/pollen-robotics/microduck-arena/releases/download/v0.7.0/microduck_arena-0.7.0-py3-none-any.whl" }
 # Official BAM actuator model. Pinned to the exact commit microduck_rl's own
 # uv.lock uses: the `mjlab_frictionloss` branch moved (now 57d13ea) and
 # mjlab_microduck no longer imports against its head (FrictionDRBamActuatorCfg

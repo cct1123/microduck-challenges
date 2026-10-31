@@ -97,7 +97,7 @@ uv run hf download pollen-robotics/microduck-hill-climb-1m5-reference policy.onn
 uv run --group workshop arena score logs/reference/hill-climb-1m5/policy.onnx --event hill-climb-1m5
 ```
 
-It scores 5.876 s, 5/5, at 0.55 m/s (checkpoint 1000 of the recipe as it stands in this folder).
+It scores 5.866 s, 5/5, at 0.55 m/s (checkpoint 1000 of the recipe as it stands in this folder).
 
 Agree with the user before the first run:
 
